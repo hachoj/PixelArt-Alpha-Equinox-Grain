@@ -1,0 +1,8 @@
+defaults:
+  - data: stage1
+  - model: dit
+  - train: stage1
+  - vae: vae
+  - optim: adamw
+  - wandb: stage1
+  - _self_
