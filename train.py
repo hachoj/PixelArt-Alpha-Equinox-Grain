@@ -55,26 +55,27 @@ def generate_samples(model, noise, labels):
 
 
 @eqx.filter_value_and_grad
-def compute_grads(model, x_t, gt, t, labels):
+def compute_grads(model, x_t, v, t, labels):
     logits = jax.vmap(model)(x_t, t, labels)
-    loss = optax.losses.l2_loss(logits, gt)
+    loss = optax.losses.l2_loss(logits, v)
     return jnp.mean(loss)
 
 
-@eqx.filter_jit
-def step_model(model, optimizer, state, x_t, gt, t, labels):
-    loss, grads = compute_grads(model, x_t, gt, t, labels)
-    updates, new_state = optimizer.update(grads, state, model)
+@eqx.filter_jit(donate="all-except-first")
+def step_model(state, optimizer, x_t, v, t, labels):
+    model, opt_state = state
 
+    loss, grads = compute_grads(model, x_t, v, t, labels)
+    updates, opt_state = optimizer.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
 
-    return model, new_state, loss
+    new_state = (model, opt_state)
+    return new_state, loss
 
 
 def train(
-    model,
-    optmizer,
     state,
+    optimizer,
     dataloader,
     vae,
     cfg,
@@ -100,8 +101,8 @@ def train(
         new_key, shape=(5, 16, 32, 32), dtype=jnp.bfloat16
     )
     validation_labels = jnp.array([0, 5, 10, 15, 1000])
-
     for step, batch in enumerate(dataloader):
+
         latent = batch["latent"]
         labels = batch["label"]
 
@@ -120,7 +121,8 @@ def train(
 
         Xt = t_mult * X1 + (1 - t_mult) * X0
 
-        model, state, loss = step_model(model, optmizer, state, Xt, X1 - X0, t, labels)
+        state, loss = step_model(state, optimizer, Xt, X1 - X0, t, labels)
+        model, _opt_state = state
 
         if cfg.wandb.enabled and (step + 1) % cfg.train.every_n_steps == 0:
             wandb.log(
@@ -163,7 +165,7 @@ def train(
         if step >= cfg.train.total_steps:
             break
 
-    return model, state
+    return state
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
@@ -176,9 +178,11 @@ def main(cfg: DictConfig):
     vae = hydra.utils.instantiate(cfg.vae).to("cuda")
 
     optimizer = hydra.utils.instantiate(cfg.optim)
-    state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
-    train(model, optimizer, state, dataloader, vae, cfg, key)
+    state = (model, opt_state)
+
+    train(state, optimizer, dataloader, vae, cfg, key)
 
 
 if __name__ == "__main__":

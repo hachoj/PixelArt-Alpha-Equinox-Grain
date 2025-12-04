@@ -16,7 +16,7 @@ class SinusoidalTimeEmbedding(eqx.Module):
     def __init__(self, dim: int):
         half_dim = dim // 2
         scale = jnp.log(10000.0) / (half_dim - 1)
-        freqs = jnp.exp(jnp.arange(half_dim) * -scale)
+        freqs = jnp.exp(jnp.arange(half_dim) * -scale).astype(jnp.bfloat16)
 
         object.__setattr__(self, "dim", dim)
         object.__setattr__(self, "half_dim", half_dim)
@@ -26,7 +26,7 @@ class SinusoidalTimeEmbedding(eqx.Module):
         # t: scalar
         emb = t * self.emb
         emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
-        return emb
+        return emb.astype(jnp.bfloat16)
 
 
 class DiT(eqx.Module):
@@ -63,9 +63,12 @@ class DiT(eqx.Module):
             padding=[0, 0],
             stride=[patch_size, patch_size],
             key=key1,
+            dtype=jnp.bfloat16,
         )
 
-        self.cond_proj = eqx.nn.Embedding(num_classes, cond_dim, key=key2)
+        self.cond_proj = eqx.nn.Embedding(
+            num_classes, cond_dim, key=key2, dtype=jnp.bfloat16
+        )
         self.time_proj = SinusoidalTimeEmbedding(time_dim)
 
         dit_keys = jr.split(key3, num_blocks)
@@ -74,15 +77,15 @@ class DiT(eqx.Module):
             for i in range(num_blocks)
         ]
 
-        self.layer_norm = eqx.nn.LayerNorm(dim)
+        self.layer_norm = eqx.nn.LayerNorm(dim, dtype=jnp.bfloat16)
 
         reshape_dim = in_dim * patch_size**2
-        self.linear_out = eqx.nn.Linear(dim, reshape_dim, key=key4)
+        self.linear_out = eqx.nn.Linear(dim, reshape_dim, key=key4, dtype=jnp.bfloat16)
         self.p = patch_size
 
         N = (image_size // patch_size) ** 2
         self.image_size = image_size
-        self.pos_embed = jnp.zeros((N, dim))
+        self.pos_embed = jnp.zeros((N, dim), dtype=jnp.bfloat16)
 
     def __call__(
         self,
@@ -98,6 +101,10 @@ class DiT(eqx.Module):
         h = H // p
         w = W // p
 
+        # Cast inputs to bfloat16
+        x = x.astype(jnp.bfloat16)
+        t = t.astype(jnp.bfloat16)
+
         time_embed = self.time_proj(t)
         class_embed = self.cond_proj(label)
 
@@ -108,7 +115,7 @@ class DiT(eqx.Module):
         x = x + self.pos_embed
 
         for block in self.dit_blocks:
-            x = block(x, time_embed, class_embed)
+            x = eqx.filter_checkpoint(block)(x, time_embed, class_embed)
 
         x = jax.vmap(self.layer_norm)(x)
 

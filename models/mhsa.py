@@ -1,5 +1,6 @@
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 import jax.random as jr
 from jaxtyping import Array, PRNGKeyArray, Float
 
@@ -10,9 +11,11 @@ class MHSA(eqx.Module):
 
     def __init__(self, dim, num_heads, key: PRNGKeyArray):
         assert dim % num_heads == 0, "Dimension must be divisible by num_heads"
-        self.layer_norm = eqx.nn.LayerNorm(dim, use_weight=False, use_bias=False)
+        self.layer_norm = eqx.nn.LayerNorm(
+            dim, use_weight=False, use_bias=False, dtype=jnp.bfloat16
+        )
         self.attention = eqx.nn.MultiheadAttention(
-            num_heads=num_heads, query_size=dim, key=key
+            num_heads=num_heads, query_size=dim, key=key, dtype=jnp.bfloat16
         )
 
     def __call__(
