@@ -24,10 +24,10 @@ import torch
 
 
 def get_trainable_mask(model):
-    # Start with all floating point arrays being True (trainable)
+    # First, get all possible trainingable params
     mask = jax.tree_util.tree_map(eqx.is_inexact_array, model)
 
-    # Explicitly set the embeddings to False (Frozen)
+    # Then mask out the trainable params you want frozen
     mask = eqx.tree_at(
         lambda m: [m.pos_embed.emb, m.time_proj.emb], mask, replace=(False, False)
     )
@@ -178,8 +178,7 @@ def train(
         eps = jax.device_put(eps, data_sharding)
 
         # t inherits the sharding from eps
-        t = jnp.clip(eps, -7, 7)
-        t = jax.nn.sigmoid(t)
+        t = jax.nn.sigmoid(eps)
         t_mult = t[:, None, None, None]
 
         Xt = t_mult * X1 + (1 - t_mult) * X0
