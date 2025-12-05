@@ -23,6 +23,17 @@ from einops import rearrange
 import torch
 
 
+def get_trainable_mask(model):
+    # Start with all floating point arrays being True (trainable)
+    mask = jax.tree_util.tree_map(eqx.is_inexact_array, model)
+
+    # Explicitly set the embeddings to False (Frozen)
+    mask = eqx.tree_at(
+        lambda m: [m.pos_embed.emb, m.time_proj.emb], mask, replace=(False, False)
+    )
+    return mask
+
+
 def single_sample_fn(model, noise, label):
     def vector_field(t, y, args):
         model, label = args
@@ -59,7 +70,9 @@ def generate_samples(model, noise, labels, model_sharding, data_sharding):
 
 
 @eqx.filter_value_and_grad
-def compute_grads(model, x_t, v, t, labels):
+def compute_grads(params, static, x_t, v, t, labels):
+    model = eqx.combine(params, static)
+
     logits = jax.vmap(model)(x_t, t, labels)
     loss = optax.losses.l2_loss(logits, v)
     return jnp.mean(loss)
@@ -75,10 +88,16 @@ def step_model(state, optimizer, x_t, v, t, labels, model_sharding, data_shardin
     model, opt_state = state
 
     x_t, v, t, labels = eqx.filter_shard((x_t, v, t, labels), data_sharding)
-    loss, grads = compute_grads(model, x_t, v, t, labels)
 
-    updates, opt_state = optimizer.update(grads, opt_state, params=model)
-    model = eqx.apply_updates(model, updates)
+    mask = get_trainable_mask(model)
+    params, static = eqx.partition(model, mask)
+
+    loss, grads = compute_grads(params, static, x_t, v, t, labels)
+
+    updates, opt_state = optimizer.update(grads, opt_state, params=params)
+    params = eqx.apply_updates(params, updates)
+
+    model = eqx.combine(params, static)
 
     return (model, opt_state), loss
 
@@ -258,7 +277,10 @@ def main(cfg: DictConfig):
 
     model = hydra.utils.instantiate(cfg.model, key=key)
     optimizer = hydra.utils.instantiate(cfg.optim)
-    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+
+    mask = get_trainable_mask(model)
+    params, _ = eqx.partition(model, mask)
+    opt_state = optimizer.init(params)
 
     # Place the VAE on CPU so it doesn't consume GPU VRAM.
     vae = hydra.utils.instantiate(cfg.vae).to("cpu")
