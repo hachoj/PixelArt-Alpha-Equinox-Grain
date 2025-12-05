@@ -7,5 +7,4 @@ mlp_ratio: 4
 num_blocks: 28
 patch_size: 2
 num_classes: 1001
-image_size: 32
 base_image_size: 32

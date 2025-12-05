@@ -106,6 +106,7 @@ def train(
         )
         wandb.define_metric("train_step")
         wandb.define_metric("train/*", step_metric="train_step")
+        wandb.define_metric("image/*", step_metric="train_step")
 
     scaling_factor = vae.config.scaling_factor
 
@@ -226,7 +227,7 @@ def train(
                 )
 
             wandb.log(
-                {"train/image": wandb.Image(decoded_images, caption="Euler Solver")}
+                {"image/examples": wandb.Image(decoded_images, caption="Euler Solver")}
             )
             start_time = time.time()
 

@@ -91,7 +91,7 @@ class DiT(eqx.Module):
         base_image_size,
         key: PRNGKeyArray,
     ):
-        key1, key2, key3, key4, key5 = jr.split(key, 5)
+        key1, key2, key3, key4 = jr.split(key, 4)
 
         self.patchify = eqx.nn.Conv2d(
             in_dim,
