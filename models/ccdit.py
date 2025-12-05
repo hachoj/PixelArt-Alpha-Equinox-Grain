@@ -45,7 +45,6 @@ class DiT(eqx.Module):
         in_dim,
         dim,
         cond_dim,
-        time_dim,
         num_heads,
         mlp_ratio,
         num_blocks,
@@ -69,11 +68,11 @@ class DiT(eqx.Module):
         self.cond_proj = eqx.nn.Embedding(
             num_classes, cond_dim, key=key2, dtype=jnp.bfloat16
         )
-        self.time_proj = SinusoidalTimeEmbedding(time_dim)
+        self.time_proj = SinusoidalTimeEmbedding(cond_dim)
 
         dit_keys = jr.split(key3, num_blocks)
         self.dit_blocks = [
-            DiTBlock(dim, cond_dim, time_dim, num_heads, mlp_ratio, key=dit_keys[i])
+            DiTBlock(dim, cond_dim, num_heads, mlp_ratio, key=dit_keys[i])
             for i in range(num_blocks)
         ]
 
@@ -115,7 +114,10 @@ class DiT(eqx.Module):
         x = x + self.pos_embed
 
         for block in self.dit_blocks:
-            x = eqx.filter_checkpoint(block)(x, time_embed, class_embed)
+            x = block(x, time_embed, class_embed)
+
+            # use this below if I need more VRAM capacity
+            # x = eqx.filter_checkpoint(block)(x, time_embed, class_embed)
 
         x = jax.vmap(self.layer_norm)(x)
 

@@ -1,5 +1,5 @@
 _target_: data.data.create_dataloader
 file_path: data/datasets/image_net.array_record
-num_workers: 16
+num_workers: 32
 batch_size: ${train.batch_size}
 seed: ${train.seed}

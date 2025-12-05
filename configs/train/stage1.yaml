@@ -1,6 +1,10 @@
 total_steps: 300000
-batch_size: 16
+batch_size: 1024
 every_n_steps: 10
-every_n_image: 100
+every_n_image: 1000
+every_n_checkpoint: 1000
+checkpoint_dir: "checkpoints"
 seed: 42
 lr: 2e-5
+max_grad: 1.0
+cfg_p: 0.1

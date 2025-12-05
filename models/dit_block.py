@@ -17,19 +17,15 @@ class DiTBlock(eqx.Module):
     alpha_1: eqx.nn.Linear
     alpha_2: eqx.nn.Linear
 
-    def __init__(
-        self, dim, cond_dim, time_dim, num_heads, mlp_ratio, key: PRNGKeyArray
-    ):
+    def __init__(self, dim, cond_dim, num_heads, mlp_ratio, key: PRNGKeyArray):
         key1, key2, key3, key4, key5, key6 = jr.split(key, 6)
 
         self.attention = MHSA(dim, num_heads, key=key1)
         self.mlp = MLP(dim, mlp_ratio, key=key2)
         self.gamma_beta_1 = eqx.nn.Linear(
-            time_dim + cond_dim, dim * 4, key=key3, dtype=jnp.bfloat16
+            cond_dim, dim * 4, key=key3, dtype=jnp.bfloat16
         )
-        self.alpha_1 = eqx.nn.Linear(
-            time_dim + cond_dim, dim * 2, key=key5, dtype=jnp.bfloat16
-        )
+        self.alpha_1 = eqx.nn.Linear(cond_dim, dim * 2, key=key5, dtype=jnp.bfloat16)
 
         alpha_2_temp = eqx.nn.Linear(dim * 2, dim * 2, key=key6, dtype=jnp.bfloat16)
         gamma_beta_2_temp = eqx.nn.Linear(
@@ -60,11 +56,11 @@ class DiTBlock(eqx.Module):
     def __call__(
         self,
         x: Float[Array, "num_patches embed_dim"],
-        t: Float[Array, "time_dim"],
+        t: Float[Array, "cond_dim"],
         c: Float[Array, "cond_dim"],
     ) -> Float[Array, "num_patches embed_dim"]:
 
-        cond = jnp.concatenate([t, c], axis=-1)
+        cond = t + c
 
         gamma_betas = self.gamma_beta_1(cond)
         gamma_betas = jax.nn.silu(gamma_betas)
