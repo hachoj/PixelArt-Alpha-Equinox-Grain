@@ -117,6 +117,9 @@ def train(
     # shard once before the loop since it's reused
     validation_noise = eqx.filter_shard(validation_noise, data_sharding)
     validation_labels = eqx.filter_shard(validation_labels, data_sharding)
+
+    start_time = time.time()
+
     for step in range(step_start, cfg.train.total_steps):
         try:
             batch = next(data_iterator)
@@ -135,14 +138,13 @@ def train(
         key, sub_key = jr.split(key)
 
         # classifier free guidience
-        key = jr.PRNGKey(cfg.train.seed)
         probs = jnp.array([1 - cfg.train.cfg_p, cfg.train.cfg_p])
         mask = jr.choice(key, 2, shape=(B,), p=probs)
 
         labels = jnp.where(mask == 1, 1000, labels)
 
         # X1 inherit the sharding from latents
-        X1 = jnp.array(latents).view(jnp.bfloat16) * scaling_factor
+        X1 = jnp.array(latents, dtype=jnp.int16).view(jnp.bfloat16) * scaling_factor
 
         key, sub_key = jr.split(key)
         # because jax sharding treats the shape as if it were on one GIGA-GPU
@@ -181,9 +183,8 @@ def train(
             )
             checkpoint_manager.save(step + 1, args=save_args)
         if cfg.wandb.enabled and (step + 1) % cfg.train.every_n_image == 0:
-            end_time = time.time()
-
             jax.block_until_ready(state)
+            end_time = time.time()
 
             generated_latents = generate_samples(
                 model,
@@ -196,7 +197,7 @@ def train(
             generated_latents = generated_latents / vae.config.scaling_factor
             generated_latents = jax.device_get(generated_latents)
 
-            start_time = time.time()
+            decode_start_time = time.time()
             generated_latents = np.array(generated_latents, copy=True)
             generated_latents = (
                 torch.from_numpy(generated_latents).to("cpu").to(dtype=torch.bfloat16)
@@ -217,19 +218,17 @@ def train(
             )
 
             print(
-                f"Time to decode latents fully on cpu: {(time.time() - start_time):.4f} s."
+                f"Time to decode latents fully on cpu: {(time.time() - decode_start_time):.4f} s."
             )
             if start_time is not None:
                 wandb.log(
-                    {
-                        f"train/{cfg.train.every_n_checkpoint} time": end_time
-                        - start_time
-                    }
+                    {f"train/{cfg.train.every_n_image} time": end_time - start_time}
                 )
-            start_time = time.time()
+
             wandb.log(
                 {"train/image": wandb.Image(decoded_images, caption="Euler Solver")}
             )
+            start_time = time.time()
 
         if step >= cfg.train.total_steps:
             break

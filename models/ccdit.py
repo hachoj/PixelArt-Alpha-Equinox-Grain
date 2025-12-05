@@ -18,14 +18,53 @@ class SinusoidalTimeEmbedding(eqx.Module):
         scale = jnp.log(10000.0) / (half_dim - 1)
         freqs = jnp.exp(jnp.arange(half_dim) * -scale).astype(jnp.bfloat16)
 
-        object.__setattr__(self, "dim", dim)
-        object.__setattr__(self, "half_dim", half_dim)
-        object.__setattr__(self, "emb", freqs)
+        self.dim = dim
+        self.half_dim = half_dim
+        self.emb = freqs
 
     def __call__(self, t: Float[Array, ""]) -> Float[Array, "dim"]:
-        # t: scalar
+        t = t * 1000
         emb = t * self.emb
         emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
+        return emb.astype(jnp.bfloat16)
+
+
+class SinusoidalPosEmbed(eqx.Module):
+    emb: Float[Array, "quarter_dim"]
+    dim: int = eqx.field(static=True)
+    quarter_dim: int = eqx.field(static=True)
+    base_h: int = eqx.field(static=True)
+    base_w: int = eqx.field(static=True)
+
+    def __init__(self, dim: int, base_size: int, patch_size: int):
+        self.base_h = base_size // patch_size
+        self.base_w = base_size // patch_size
+
+        self.dim = dim
+        self.quarter_dim = dim // 4
+
+        scale = jnp.log(10000.0) / (self.quarter_dim - 1)
+        self.emb = jnp.exp(jnp.arange(self.quarter_dim) * -scale).astype(jnp.bfloat16)
+
+    def __call__(self, h: int, w: int) -> Float[Array, "h*w dim"]:
+        scale_h = self.base_h / h
+        scale_w = self.base_w / w
+
+        grid_y, grid_x = jnp.meshgrid(
+            jnp.arange(h) * scale_h, jnp.arange(w) * scale_w, indexing="ij"
+        )
+
+        grid_y = grid_y.reshape(-1)
+        grid_x = grid_x.reshape(-1)
+
+        emb_y = grid_y[:, None] * self.emb[None, :]
+        emb_x = grid_x[:, None] * self.emb[None, :]
+
+        emb_y = jnp.concatenate([jnp.sin(emb_y), jnp.cos(emb_y)], axis=-1)
+        emb_x = jnp.concatenate([jnp.sin(emb_x), jnp.cos(emb_x)], axis=-1)
+
+        emb = jnp.concatenate([emb_y, emb_x], axis=-1)
+
         return emb.astype(jnp.bfloat16)
 
 
@@ -36,9 +75,8 @@ class DiT(eqx.Module):
     cond_proj: eqx.nn.Embedding
     time_proj: SinusoidalTimeEmbedding
     linear_out: eqx.nn.Linear
-    pos_embed: jax.Array
+    pos_embed: SinusoidalPosEmbed
     p: int = eqx.field(static=True)
-    image_size: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -50,10 +88,10 @@ class DiT(eqx.Module):
         num_blocks,
         patch_size,
         num_classes,
-        image_size,
+        base_image_size,
         key: PRNGKeyArray,
     ):
-        key1, key2, key3, key4 = jr.split(key, 4)
+        key1, key2, key3, key4, key5 = jr.split(key, 5)
 
         self.patchify = eqx.nn.Conv2d(
             in_dim,
@@ -82,9 +120,7 @@ class DiT(eqx.Module):
         self.linear_out = eqx.nn.Linear(dim, reshape_dim, key=key4, dtype=jnp.bfloat16)
         self.p = patch_size
 
-        N = (image_size // patch_size) ** 2
-        self.image_size = image_size
-        self.pos_embed = jnp.zeros((N, dim), dtype=jnp.bfloat16)
+        self.pos_embed = SinusoidalPosEmbed(dim, base_image_size, patch_size)
 
     def __call__(
         self,
@@ -93,9 +129,6 @@ class DiT(eqx.Module):
         label: Int[Array, ""],
     ) -> Float[Array, "in_dim height width"]:
         _, H, W = x.shape
-        assert (
-            H == self.image_size and W == self.image_size
-        ), "Passed in images must match initialiation"
         p = self.p
         h = H // p
         w = W // p
@@ -111,7 +144,7 @@ class DiT(eqx.Module):
         x = self.patchify(x)
         x = rearrange(x, "c h w -> (h w) c")
 
-        x = x + self.pos_embed
+        x = x + self.pos_embed(h, w)
 
         for block in self.dit_blocks:
             x = block(x, time_embed, class_embed)
