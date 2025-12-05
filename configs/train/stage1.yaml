@@ -5,6 +5,7 @@ every_n_image: 1000
 every_n_checkpoint: 1000
 checkpoint_dir: "checkpoints"
 seed: 42
-lr: 2e-5
+lr: 1e-4
 max_grad: 1.0
 cfg_p: 0.1
+warmup_steps: 1000
