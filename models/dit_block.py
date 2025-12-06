@@ -22,24 +22,18 @@ class DiTBlock(eqx.Module):
 
         self.attention = MHSA(dim, num_heads, key=key1)
         self.mlp = MLP(dim, mlp_ratio, key=key2)
-        self.gamma_beta_1 = eqx.nn.Linear(
-            cond_dim, dim * 4, key=key3, dtype=jnp.bfloat16
-        )
-        self.alpha_1 = eqx.nn.Linear(cond_dim, dim * 2, key=key5, dtype=jnp.bfloat16)
+        self.gamma_beta_1 = eqx.nn.Linear(cond_dim, dim * 4, key=key3)
+        self.alpha_1 = eqx.nn.Linear(cond_dim, dim * 2, key=key5)
 
-        alpha_2_temp = eqx.nn.Linear(dim * 2, dim * 2, key=key6, dtype=jnp.bfloat16)
-        gamma_beta_2_temp = eqx.nn.Linear(
-            dim * 4, dim * 4, key=key4, dtype=jnp.bfloat16
-        )
+        alpha_2_temp = eqx.nn.Linear(dim * 2, dim * 2, key=key6)
+        gamma_beta_2_temp = eqx.nn.Linear(dim * 4, dim * 4, key=key4)
 
         alpha_zeros_w = jnp.zeros_like(alpha_2_temp.weight)
         alpha_zeros_b = jnp.zeros_like(alpha_2_temp.bias)  # pyrefly:ignore
         gamma_beta_zeros_w = jnp.zeros_like(gamma_beta_2_temp.weight)
         gamma_beta_zeros_b = jnp.zeros_like(gamma_beta_2_temp.bias)  # pyrefly:ignore
 
-        self.gamma_beta_2 = eqx.nn.Linear(
-            dim * 4, dim * 4, key=key4, dtype=jnp.bfloat16
-        )
+        self.gamma_beta_2 = eqx.nn.Linear(dim * 4, dim * 4, key=key4)
 
         self.alpha_2 = eqx.tree_at(
             lambda l: (l.weight, l.bias), alpha_2_temp, (alpha_zeros_w, alpha_zeros_b)

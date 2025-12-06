@@ -2,7 +2,7 @@ _target_: models.ccdit.DiT
 in_dim: 16
 dim: 1152
 cond_dim: 256
-num_heads: 12
+num_heads: 16
 mlp_ratio: 4
 num_blocks: 28
 patch_size: 2

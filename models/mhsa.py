@@ -18,7 +18,7 @@ class QKNormedAttention(eqx.Module):
     q_norm: eqx.nn.RMSNorm
     k_norm: eqx.nn.RMSNorm
 
-    def __init__(self, num_heads, dim, key, dtype):
+    def __init__(self, num_heads, dim, key, dtype=None):
         assert dim % num_heads == 0, "Dimension must be divisible by num_heads"
         self.num_heads = num_heads
         self.query_size = dim // num_heads
@@ -65,12 +65,8 @@ class MHSA(eqx.Module):
 
     def __init__(self, dim, num_heads, key: PRNGKeyArray):
         assert dim % num_heads == 0, "Dimension must be divisible by num_heads"
-        self.layer_norm = eqx.nn.LayerNorm(
-            dim, use_weight=False, use_bias=False, dtype=jnp.bfloat16
-        )
-        self.attention = QKNormedAttention(
-            num_heads=num_heads, dim=dim, key=key, dtype=jnp.bfloat16
-        )
+        self.layer_norm = eqx.nn.LayerNorm(dim, use_weight=False, use_bias=False)
+        self.attention = QKNormedAttention(num_heads=num_heads, dim=dim, key=key)
 
     def __call__(
         self,

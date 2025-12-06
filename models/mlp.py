@@ -12,13 +12,11 @@ class MLP(eqx.Module):
 
     def __init__(self, dim: int, mlp_ratio: int, key: PRNGKeyArray):
         key1, key2 = jr.split(key, 2)
-        self.layer_norm = eqx.nn.LayerNorm(
-            dim, use_weight=False, use_bias=False, dtype=jnp.bfloat16
-        )
+        self.layer_norm = eqx.nn.LayerNorm(dim, use_weight=False, use_bias=False)
 
         hidden_dim = dim * mlp_ratio
-        self.linear1 = eqx.nn.Linear(dim, hidden_dim, key=key1, dtype=jnp.bfloat16)
-        self.linear2 = eqx.nn.Linear(hidden_dim, dim, key=key2, dtype=jnp.bfloat16)
+        self.linear1 = eqx.nn.Linear(dim, hidden_dim, key=key1)
+        self.linear2 = eqx.nn.Linear(hidden_dim, dim, key=key2)
 
     def __call__(
         self,

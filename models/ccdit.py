@@ -16,7 +16,7 @@ class SinusoidalTimeEmbedding(eqx.Module):
     def __init__(self, dim: int):
         half_dim = dim // 2
         scale = jnp.log(10000.0) / (half_dim - 1)
-        freqs = jnp.exp(jnp.arange(half_dim) * -scale).astype(jnp.bfloat16)
+        freqs = jnp.exp(jnp.arange(half_dim) * -scale)
 
         self.dim = dim
         self.half_dim = half_dim
@@ -26,7 +26,7 @@ class SinusoidalTimeEmbedding(eqx.Module):
         t = t * 1000
         emb = t * self.emb
         emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
-        return emb.astype(jnp.bfloat16)
+        return emb
 
 
 class SinusoidalPosEmbed(eqx.Module):
@@ -44,7 +44,7 @@ class SinusoidalPosEmbed(eqx.Module):
         self.quarter_dim = dim // 4
 
         scale = jnp.log(10000.0) / (self.quarter_dim - 1)
-        self.emb = jnp.exp(jnp.arange(self.quarter_dim) * -scale).astype(jnp.bfloat16)
+        self.emb = jnp.exp(jnp.arange(self.quarter_dim) * -scale)
 
     def __call__(self, h: int, w: int) -> Float[Array, "h*w dim"]:
         scale_h = self.base_h / h
@@ -65,7 +65,7 @@ class SinusoidalPosEmbed(eqx.Module):
 
         emb = jnp.concatenate([emb_y, emb_x], axis=-1)
 
-        return emb.astype(jnp.bfloat16)
+        return emb
 
 
 class DiT(eqx.Module):
@@ -100,12 +100,9 @@ class DiT(eqx.Module):
             padding=[0, 0],
             stride=[patch_size, patch_size],
             key=key1,
-            dtype=jnp.bfloat16,
         )
 
-        self.cond_proj = eqx.nn.Embedding(
-            num_classes, cond_dim, key=key2, dtype=jnp.bfloat16
-        )
+        self.cond_proj = eqx.nn.Embedding(num_classes, cond_dim, key=key2)
         self.time_proj = SinusoidalTimeEmbedding(cond_dim)
 
         dit_keys = jr.split(key3, num_blocks)
@@ -114,10 +111,10 @@ class DiT(eqx.Module):
             for i in range(num_blocks)
         ]
 
-        self.layer_norm = eqx.nn.LayerNorm(dim, dtype=jnp.bfloat16)
+        self.layer_norm = eqx.nn.LayerNorm(dim)
 
         reshape_dim = in_dim * patch_size**2
-        self.linear_out = eqx.nn.Linear(dim, reshape_dim, key=key4, dtype=jnp.bfloat16)
+        self.linear_out = eqx.nn.Linear(dim, reshape_dim, key=key4)
         self.p = patch_size
 
         self.pos_embed = SinusoidalPosEmbed(dim, base_image_size, patch_size)
@@ -132,10 +129,6 @@ class DiT(eqx.Module):
         p = self.p
         h = H // p
         w = W // p
-
-        # Cast inputs to bfloat16
-        x = x.astype(jnp.bfloat16)
-        t = t.astype(jnp.bfloat16)
 
         time_embed = self.time_proj(t)
         class_embed = self.cond_proj(label)

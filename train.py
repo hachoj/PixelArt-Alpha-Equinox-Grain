@@ -23,6 +23,18 @@ from einops import rearrange
 import torch
 
 
+@eqx.filter_jit
+def update_ema(model_ema, model_train, decay):
+    mask = get_trainable_mask(model_ema)
+    params_ema, static_ema = eqx.partition(model_ema, mask)
+    params_train, _ = eqx.partition(model_train, mask)
+
+    step_size = 1.0 - decay
+    params_ema = optax.incremental_update(params_train, params_ema, step_size)
+
+    return eqx.combine(params_ema, static_ema)
+
+
 def get_trainable_mask(model):
     # First, get all possible trainingable params
     mask = jax.tree_util.tree_map(eqx.is_inexact_array, model)
@@ -85,25 +97,40 @@ def step_model(state, optimizer, x_t, v, t, labels, model_sharding, data_shardin
 
     # model, opt_state = state
     state = eqx.filter_shard(state, model_sharding)
-    model, opt_state = state
+    model_fp32, opt_state = state
+    mask = get_trainable_mask(model_fp32)
+    params_fp32, static_fp32 = eqx.partition(model_fp32, mask)
+
+    # cast model weights to bf16
+    params_bf16 = jax.tree_util.tree_map(
+        lambda x: x.astype(jnp.bfloat16) if eqx.is_inexact_array(x) else x, params_fp32
+    )
+    static_bf16 = jax.tree_util.tree_map(
+        lambda x: x.astype(jnp.bfloat16) if eqx.is_inexact_array(x) else x, static_fp32
+    )
 
     x_t, v, t, labels = eqx.filter_shard((x_t, v, t, labels), data_sharding)
+    x_t, v, t = (
+        x_t.astype(jnp.bfloat16),
+        v.astype(jnp.bfloat16),
+        t.astype(jnp.bfloat16),
+    )
 
-    mask = get_trainable_mask(model)
-    params, static = eqx.partition(model, mask)
+    loss, grads = compute_grads(params_bf16, static_bf16, x_t, v, t, labels)
 
-    loss, grads = compute_grads(params, static, x_t, v, t, labels)
+    # use bf16 grads to update fp32 weights since bf16 should be stable enough
+    # without the use of grad scaling
+    updates, opt_state = optimizer.update(grads, opt_state, params=params_fp32)
+    params_fp32 = eqx.apply_updates(params_fp32, updates)
 
-    updates, opt_state = optimizer.update(grads, opt_state, params=params)
-    params = eqx.apply_updates(params, updates)
+    model_fp32 = eqx.combine(params_fp32, static_fp32)
 
-    model = eqx.combine(params, static)
-
-    return (model, opt_state), loss
+    return (model_fp32, opt_state), loss
 
 
 def train(
     state,
+    model_ema,
     optimizer,
     data_iterator,
     vae,
@@ -127,7 +154,7 @@ def train(
         wandb.define_metric("train/*", step_metric="train_step")
         wandb.define_metric("image/*", step_metric="train_step")
 
-    scaling_factor = vae.config.scaling_factor
+    scaling_factor = cfg.train.scaling_factor
     # Computed from ~800k images
     latent_mean = jnp.array(
         [
@@ -153,7 +180,8 @@ def train(
 
     key, sub_key = jr.split(key)
 
-    validation_noise = jax.random.normal(key, shape=(8, 16, 32, 32), dtype=jnp.bfloat16)
+    validation_noise = jax.random.normal(key, shape=(1, 16, 32, 32), dtype=jnp.bfloat16)
+    validation_noise = jnp.repeat(validation_noise, repeats=8, axis=0)
     validation_labels = jnp.array([0, 5, 10, 15, 200, 500, 750, 1000])
 
     # shard once before the loop since it's reused
@@ -223,9 +251,12 @@ def train(
                     "train/loss": loss,
                 }
             )
+        if (step + 1) % cfg.train.every_n_ema == 0:
+            model_ema = update_ema(model_ema, model, decay=cfg.train.ema_decay)
         if (step + 1) % cfg.train.every_n_checkpoint == 0:
             save_args = orbax.checkpoint.args.Composite(
                 model=orbax.checkpoint.args.StandardSave(state),
+                model_ema=orbax.checkpoint.args.StandardSave(model_ema),
                 dataset=grain.PyGrainCheckpointSave(data_iterator),
             )
             checkpoint_manager.save(step + 1, args=save_args)
@@ -234,7 +265,7 @@ def train(
             end_time = time.time()
 
             generated_latents = generate_samples(
-                model,
+                model_ema,
                 validation_noise,
                 validation_labels,
                 model_sharding,
@@ -306,6 +337,10 @@ def main(cfg: DictConfig):
     model = hydra.utils.instantiate(cfg.model, key=key)
     optimizer = hydra.utils.instantiate(cfg.optim)
 
+    model_ema = jax.tree_util.tree_map(
+        lambda x: jnp.copy(x) if eqx.is_inexact_array(x) else x, model
+    )
+
     mask = get_trainable_mask(model)
     params, _ = eqx.partition(model, mask)
     opt_state = optimizer.init(params)
@@ -315,6 +350,8 @@ def main(cfg: DictConfig):
 
     state = (model, opt_state)
     state = eqx.filter_shard(state, model_sharding)
+
+    model_ema = eqx.filter_shard(model_ema, model_sharding)
 
     step_start = 0
     if checkpoint_manager.latest_step() is not None:
@@ -333,6 +370,7 @@ def main(cfg: DictConfig):
 
     train(
         state,
+        model_ema,
         optimizer,
         data_iterator,
         vae,
