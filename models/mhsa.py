@@ -3,7 +3,6 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jaxtyping import Array, PRNGKeyArray, Float
-from einops import rearrange
 
 
 class QKNormedAttention(eqx.Module):
@@ -48,15 +47,14 @@ class QKNormedAttention(eqx.Module):
         q = jax.vmap(self.q_norm)(q)
         k = jax.vmap(self.k_norm)(k)
 
-        q = rearrange(q, "n (h d) -> n h d", h=self.num_heads)
-        k = rearrange(k, "n (h d) -> n h d", h=self.num_heads)
-        v = rearrange(v, "n (h d) -> n h d", h=self.num_heads)
+        n, _ = q.shape
+        q = q.reshape(n, self.num_heads, -1)
+        k = k.reshape(n, self.num_heads, -1)
+        v = v.reshape(n, self.num_heads, -1)
 
-        attn_logits = jnp.einsum("n h d, m h d -> n m h", q, k) * self.scale
-        attn_weight = jax.nn.softmax(attn_logits, axis=1)
-        attn_output = jnp.einsum("n m h, m h d -> n h d", attn_weight, v)
+        attn_output = jax.nn.dot_product_attention(q, k, v, scale=self.scale)
 
-        attn_output = rearrange(attn_output, "n h d -> n (h d)")
+        attn_output = attn_output.reshape(n, -1)
         out = jax.vmap(self.out_proj)(attn_output)
         return out
 

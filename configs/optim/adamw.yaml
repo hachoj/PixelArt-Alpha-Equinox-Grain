@@ -2,3 +2,4 @@ _target_: models.optim.build_optimizer
 lr: ${train.lr}
 max_grad: ${train.max_grad}
 warmup_steps: ${train.warmup_steps}
+weight_decay: ${train.weight_decay}

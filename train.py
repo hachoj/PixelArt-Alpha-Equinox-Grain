@@ -128,6 +128,28 @@ def train(
         wandb.define_metric("image/*", step_metric="train_step")
 
     scaling_factor = vae.config.scaling_factor
+    # Computed from ~800k images
+    latent_mean = jnp.array(
+        [
+            0.8951277,
+            -0.27458745,
+            -0.10973451,
+            0.9663296,
+            1.1391017,
+            0.33827597,
+            -0.13424845,
+            -0.97946304,
+            -0.41076022,
+            0.8262475,
+            1.139077,
+            0.7410347,
+            1.1904861,
+            -1.3059448,
+            -0.8135325,
+            -0.3679146,
+        ],
+        dtype=jnp.float32,
+    )
 
     key, sub_key = jr.split(key)
 
@@ -165,6 +187,12 @@ def train(
 
         # X1 inherit the sharding from latents
         X1 = jnp.array(latents, dtype=jnp.int16).view(jnp.bfloat16) * scaling_factor
+
+        if not jnp.all(jnp.isfinite(X1)):
+            print(f"Skipping step {step}: NaN detected in latents")
+            continue
+
+        X1 = X1 - latent_mean[None, :, None, None]
 
         key, sub_key = jr.split(key)
         # because jax sharding treats the shape as if it were on one GIGA-GPU
@@ -213,6 +241,7 @@ def train(
                 data_sharding,
             )
 
+            generated_latents = generated_latents + latent_mean[None, :, None, None]
             generated_latents = generated_latents / vae.config.scaling_factor
             generated_latents = jax.device_get(generated_latents)
 
