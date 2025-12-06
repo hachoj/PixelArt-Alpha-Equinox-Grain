@@ -13,6 +13,6 @@ def build_optimizer(lr, max_grad, warmup_steps):
     )
     optimizer = optax.chain(
         optax.clip_by_global_norm(max_grad),
-        optax.adamw(learning_rate=schedule, weight_decay=0.0),
+        optax.adamw(learning_rate=schedule, eps=1e-15, weight_decay=0.0),
     )
     return optimizer
