@@ -20,6 +20,7 @@ class QKNormedAttention(eqx.Module):
     k_norm: eqx.nn.RMSNorm
 
     def __init__(self, num_heads, dim, key, dtype):
+        assert dim % num_heads == 0, "Dimension must be divisible by num_heads"
         self.num_heads = num_heads
         self.query_size = dim // num_heads
         self.scale = self.query_size**-0.5
