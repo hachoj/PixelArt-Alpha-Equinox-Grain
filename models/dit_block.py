@@ -33,8 +33,6 @@ class DiTBlock(eqx.Module):
         gamma_beta_zeros_w = jnp.zeros_like(gamma_beta_2_temp.weight)
         gamma_beta_zeros_b = jnp.zeros_like(gamma_beta_2_temp.bias)  # pyrefly:ignore
 
-        self.gamma_beta_2 = eqx.nn.Linear(dim * 4, dim * 4, key=key4)
-
         self.alpha_2 = eqx.tree_at(
             lambda l: (l.weight, l.bias), alpha_2_temp, (alpha_zeros_w, alpha_zeros_b)
         )

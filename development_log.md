@@ -15,3 +15,8 @@ SD3 flow matching optimizations. `
 3. RMS norm for q and k in attention using jax.scaled_dot_product_attention
 4. logit-normal time step sampling.
 5. Adding EMA weighted model
+   - In the future, I might have to put the EMA model on a separate GPU because it takes up a lot of space on the GPUs just for inference
+   - And if the batch size was bigger, it wouldn't fit.
+
+
+Note for the reparameterization trick, I will use the conditionless embedding as the base line

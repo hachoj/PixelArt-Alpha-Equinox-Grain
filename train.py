@@ -1,3 +1,4 @@
+from etils.etree import jax
 import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -23,6 +24,13 @@ from einops import rearrange
 import torch
 
 
+def ema_scheduler(decay, init_decay, step, warmup_steps):
+    if step >= warmup_steps:
+        return decay
+    else:
+        return ((decay - init_decay) / warmup_steps) * step + init_decay
+
+
 @eqx.filter_jit
 def update_ema(model_ema, model_train, decay):
     mask = get_trainable_mask(model_ema)
@@ -42,6 +50,17 @@ def get_trainable_mask(model):
     # Then mask out the trainable params you want frozen
     mask = eqx.tree_at(
         lambda m: [m.pos_embed.emb, m.time_proj.emb], mask, replace=(False, False)
+    )
+    return mask
+
+
+def get_weight_decay_mask(model):
+    mask = jax.tree_util.tree_map(eqx.is_inexact_array, model)
+
+    # 3. Set weight decay to False for these specific layers
+    # This keeps them trainable (grads applied), but prevents AdamW from shrinking them
+    mask = eqx.tree_at(
+        lambda m: m.cond_proj.weight, mask, replace=False
     )
     return mask
 
@@ -154,29 +173,7 @@ def train(
         wandb.define_metric("train/*", step_metric="train_step")
         wandb.define_metric("image/*", step_metric="train_step")
 
-    scaling_factor = cfg.train.scaling_factor
-    # Computed from ~800k images
-    latent_mean = jnp.array(
-        [
-            0.8951277,
-            -0.27458745,
-            -0.10973451,
-            0.9663296,
-            1.1391017,
-            0.33827597,
-            -0.13424845,
-            -0.97946304,
-            -0.41076022,
-            0.8262475,
-            1.139077,
-            0.7410347,
-            1.1904861,
-            -1.3059448,
-            -0.8135325,
-            -0.3679146,
-        ],
-        dtype=jnp.float32,
-    )
+    scaling_factor = vae.config.scaling_factor
 
     key, sub_key = jr.split(key)
 
@@ -220,7 +217,7 @@ def train(
             print(f"Skipping step {step}: NaN detected in latents")
             continue
 
-        X1 = X1 - latent_mean[None, :, None, None]
+        X1 = X1 - cfg.train.latent_mean
 
         key, sub_key = jr.split(key)
         # because jax sharding treats the shape as if it were on one GIGA-GPU
@@ -252,7 +249,10 @@ def train(
                 }
             )
         if (step + 1) % cfg.train.every_n_ema == 0:
-            model_ema = update_ema(model_ema, model, decay=cfg.train.ema_decay)
+            decay = ema_scheduler(
+                cfg.train.ema_decay, cfg.train.ema_init, step, cfg.train.ema_warmup
+            )
+            model_ema = update_ema(model_ema, model, decay=decay)
         if (step + 1) % cfg.train.every_n_checkpoint == 0:
             save_args = orbax.checkpoint.args.Composite(
                 model=orbax.checkpoint.args.StandardSave(state),
@@ -264,7 +264,7 @@ def train(
             jax.block_until_ready(state)
             end_time = time.time()
 
-            generated_latents = generate_samples(
+            generated_latents_ema = generate_samples(
                 model_ema,
                 validation_noise,
                 validation_labels,
@@ -272,29 +272,65 @@ def train(
                 data_sharding,
             )
 
-            generated_latents = generated_latents + latent_mean[None, :, None, None]
-            generated_latents = generated_latents / vae.config.scaling_factor
-            generated_latents = jax.device_get(generated_latents)
+            generated_latents_ema = generated_latents_ema + cfg.train.latent_mean
+            generated_latents_ema = generated_latents_ema / vae.config.scaling_factor
+            jax.block_until_ready(generated_latents_ema)
+
+            generated_latents_model = generate_samples(
+                model,
+                validation_noise,
+                validation_labels,
+                model_sharding,
+                data_sharding,
+            )
+            generated_latents_model = generated_latents_model + cfg.train.latent_mean
+            generated_latents_model = (
+                generated_latents_model / vae.config.scaling_factor
+            )
+
+            generated_latents_ema = jax.device_get(generated_latents_ema)
+            generated_latents_model = jax.device_get(generated_latents_model)
 
             decode_start_time = time.time()
-            generated_latents = np.array(generated_latents, copy=True)
-            generated_latents = (
-                torch.from_numpy(generated_latents).to("cpu").to(dtype=torch.bfloat16)
+            generated_latents_ema = np.array(generated_latents_ema, copy=True)
+            generated_latents_model = np.array(generated_latents_model, copy=True)
+            generated_latents_ema = (
+                torch.from_numpy(generated_latents_ema)
+                .to("cpu")
+                .to(dtype=torch.bfloat16)
+            )
+            generated_latents_model = (
+                torch.from_numpy(generated_latents_model)
+                .to("cpu")
+                .to(dtype=torch.bfloat16)
             )
 
             # [B,T,C,H,W]
-            generated_latents = generated_latents.view(-1, 16, 32, 32)
+            generated_latents_ema = generated_latents_ema.view(-1, 16, 32, 32)
+            generated_latents_model = generated_latents_model.view(-1, 16, 32, 32)
             with torch.inference_mode():
-                decoded_images = vae.decode(generated_latents)[0]
-            decoded_images = rearrange(
-                decoded_images,
+                decoded_images_ema = vae.decode(generated_latents_ema)[0]
+                decoded_images_model = vae.decode(generated_latents_model)[0]
+            decoded_images_ema = rearrange(
+                decoded_images_ema,
+                "(b t) c h w -> c (b h) (t w)",
+                b=validation_noise.shape[0],
+            )
+            decoded_images_model = rearrange(
+                decoded_images_model,
                 "(b t) c h w -> c (b h) (t w)",
                 b=validation_noise.shape[0],
             )
 
-            decoded_images = (
-                decoded_images.permute(1, 2, 0).clip(0, 1).float().numpy() * 255.0
+            decoded_images_ema = (
+                decoded_images_ema.permute(1, 2, 0).clip(0, 1).float().numpy() * 255.0
             )
+            decoded_images_model = (
+                decoded_images_model.permute(1, 2, 0).clip(0, 1).float().numpy() * 255.0
+            )
+            decoded_images = np.concatenate(
+                [decoded_images_ema, decoded_images_model], axis=1
+            ).astype(np.uint8)
 
             print(
                 f"Time to decode latents fully on cpu: {(time.time() - decode_start_time):.4f} s."
@@ -325,7 +361,7 @@ def main(cfg: DictConfig):
     ckpt_dir = os.path.abspath(cfg.train.checkpoint_dir)
     options = orbax.checkpoint.CheckpointManagerOptions(max_to_keep=5, create=True)
     checkpoint_manager = orbax.checkpoint.CheckpointManager(
-        ckpt_dir, options=options, item_names=("model", "dataset")
+        ckpt_dir, options=options, item_names=("model", "model_ema", "dataset")
     )
 
     model_sharding = jshard.NamedSharding(mesh, jshard.PartitionSpec())
@@ -335,14 +371,16 @@ def main(cfg: DictConfig):
     data_iterator = iter(dataloader)
 
     model = hydra.utils.instantiate(cfg.model, key=key)
-    optimizer = hydra.utils.instantiate(cfg.optim)
-
     model_ema = jax.tree_util.tree_map(
         lambda x: jnp.copy(x) if eqx.is_inexact_array(x) else x, model
     )
 
-    mask = get_trainable_mask(model)
-    params, _ = eqx.partition(model, mask)
+    trainable_mask = get_trainable_mask(model)
+    params, _ = eqx.partition(model, trainable_mask)
+
+    wd_mask = get_weight_decay_mask(params)
+    optimizer = hydra.utils.instantiate(cfg.optim, mask=wd_mask)
+
     opt_state = optimizer.init(params)
 
     # Place the VAE on CPU so it doesn't consume GPU VRAM.
@@ -360,12 +398,14 @@ def main(cfg: DictConfig):
         )
         restore_args = orbax.checkpoint.args.Composite(
             model=orbax.checkpoint.args.StandardRestore(item=state),
+            model_ema=orbax.checkpoint.args.StandardRestore(item=model_ema),
             dataset=grain.PyGrainCheckpointRestore(data_iterator),
         )
         restored = checkpoint_manager.restore(
             checkpoint_manager.latest_step(), args=restore_args
         )
         state = restored["model"]
+        model_ema = restored["model_ema"]
         step_start = checkpoint_manager.latest_step()
 
     train(
