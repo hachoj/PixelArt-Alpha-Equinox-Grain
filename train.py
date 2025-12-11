@@ -43,11 +43,8 @@ def update_ema(model_ema, model_train, decay):
     return eqx.combine(params_ema, static_ema)
 
 
-def get_trainable_mask(model, abstract=False):
-    if abstract:
-        mask = jax.tree_util.tree_map(eqx.is_inexact_array, model)
-    else:
-        mask = jax.tree_util.tree_map(eqx.is_inexact_array, model)
+def get_trainable_mask(model):
+    mask = jax.tree_util.tree_map(eqx.is_inexact_array, model)
 
     mask = eqx.tree_at(
         lambda m: [m.pos_embed.emb, m.time_proj.emb], mask, replace=(False, False)
@@ -252,7 +249,7 @@ def train(
             model_ema = update_ema(model_ema, model, decay=decay)
         if (step + 1) % cfg.train.every_n_checkpoint == 0:
             save_args = ocp.args.Composite(
-                model=ocp.args.StandardSave(state),
+                state=ocp.args.StandardSave(state),
                 model_ema=ocp.args.StandardSave(model_ema),
                 dataset=grain.PyGrainCheckpointSave(data_iterator),
             )
@@ -358,7 +355,7 @@ def main(cfg: DictConfig):
     ckpt_dir = os.path.abspath(cfg.train.checkpoint_dir)
     options = ocp.CheckpointManagerOptions(max_to_keep=5, create=True)
     checkpoint_manager = ocp.CheckpointManager(
-        ckpt_dir, options=options, item_names=("model", "model_ema", "dataset")
+        ckpt_dir, options=options, item_names=("state", "model_ema", "dataset")
     )
 
     model_sharding = jshard.NamedSharding(mesh, jshard.PartitionSpec())
@@ -369,7 +366,7 @@ def main(cfg: DictConfig):
     data_iterator = iter(dataloader)
 
     model = hydra.utils.instantiate(cfg.model, key=key)
-    trainable_mask = get_trainable_mask(model, abstract=True)
+    trainable_mask = get_trainable_mask(model)
     params, _ = eqx.partition(model, trainable_mask)
 
     wd_mask = get_weight_decay_mask(params)
@@ -409,7 +406,7 @@ def main(cfg: DictConfig):
             f"Restoring previous trianing at step {checkpoint_manager.latest_step()}/{cfg.train.total_steps}"
         )
         restore_args = ocp.args.Composite(
-            model=ocp.args.StandardRestore(abstract_state),
+            state=ocp.args.StandardRestore(abstract_state),
             model_ema=ocp.args.StandardRestore(abstract_model),
             dataset=grain.PyGrainCheckpointRestore(data_iterator),
         )
