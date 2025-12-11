@@ -141,10 +141,13 @@ dmypy.json
 *.pb
 *.tflite
 *.tfl
+*.npy
+*.npz
 checkpoints/
 models/weights/
 weights/
 saved_models/
+0saved_models/
 
 # Training outputs and logs
 outputs/

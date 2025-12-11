@@ -1,4 +1,3 @@
-from etils.etree import jax
 import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -8,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 import jax.sharding as jshard
-import orbax.checkpoint
+import orbax.checkpoint as ocp
 import equinox as eqx
 import optax
 import numpy as np
@@ -18,6 +17,7 @@ import hydra
 from omegaconf import DictConfig
 import wandb
 import time
+import gc
 
 import diffrax
 from einops import rearrange
@@ -43,11 +43,12 @@ def update_ema(model_ema, model_train, decay):
     return eqx.combine(params_ema, static_ema)
 
 
-def get_trainable_mask(model):
-    # First, get all possible trainingable params
-    mask = jax.tree_util.tree_map(eqx.is_inexact_array, model)
+def get_trainable_mask(model, abstract=False):
+    if abstract:
+        mask = jax.tree_util.tree_map(eqx.is_inexact_array, model)
+    else:
+        mask = jax.tree_util.tree_map(eqx.is_inexact_array, model)
 
-    # Then mask out the trainable params you want frozen
     mask = eqx.tree_at(
         lambda m: [m.pos_embed.emb, m.time_proj.emb], mask, replace=(False, False)
     )
@@ -57,11 +58,7 @@ def get_trainable_mask(model):
 def get_weight_decay_mask(model):
     mask = jax.tree_util.tree_map(eqx.is_inexact_array, model)
 
-    # 3. Set weight decay to False for these specific layers
-    # This keeps them trainable (grads applied), but prevents AdamW from shrinking them
-    mask = eqx.tree_at(
-        lambda m: m.cond_proj.weight, mask, replace=False
-    )
+    mask = eqx.tree_at(lambda m: m.cond_proj.weight, mask, replace=False)
     return mask
 
 
@@ -254,9 +251,9 @@ def train(
             )
             model_ema = update_ema(model_ema, model, decay=decay)
         if (step + 1) % cfg.train.every_n_checkpoint == 0:
-            save_args = orbax.checkpoint.args.Composite(
-                model=orbax.checkpoint.args.StandardSave(state),
-                model_ema=orbax.checkpoint.args.StandardSave(model_ema),
+            save_args = ocp.args.Composite(
+                model=ocp.args.StandardSave(state),
+                model_ema=ocp.args.StandardSave(model_ema),
                 dataset=grain.PyGrainCheckpointSave(data_iterator),
             )
             checkpoint_manager.save(step + 1, args=save_args)
@@ -341,7 +338,7 @@ def train(
                 )
 
             wandb.log(
-                {"image/examples": wandb.Image(decoded_images, caption="Euler Solver")}
+                {"image/examples": wandb.Image(decoded_images, caption="EMA | Regular")}
             )
             start_time = time.time()
 
@@ -359,54 +356,90 @@ def main(cfg: DictConfig):
     key = jr.PRNGKey(cfg.train.seed)
 
     ckpt_dir = os.path.abspath(cfg.train.checkpoint_dir)
-    options = orbax.checkpoint.CheckpointManagerOptions(max_to_keep=5, create=True)
-    checkpoint_manager = orbax.checkpoint.CheckpointManager(
+    options = ocp.CheckpointManagerOptions(max_to_keep=5, create=True)
+    checkpoint_manager = ocp.CheckpointManager(
         ckpt_dir, options=options, item_names=("model", "model_ema", "dataset")
     )
 
     model_sharding = jshard.NamedSharding(mesh, jshard.PartitionSpec())
     data_sharding = jshard.NamedSharding(mesh, jshard.PartitionSpec("data"))
+    cpu_sharding = jax.sharding.SingleDeviceSharding(jax.devices("cpu")[0])
 
     dataloader = hydra.utils.instantiate(cfg.data)
     data_iterator = iter(dataloader)
 
     model = hydra.utils.instantiate(cfg.model, key=key)
-    model_ema = jax.tree_util.tree_map(
-        lambda x: jnp.copy(x) if eqx.is_inexact_array(x) else x, model
-    )
-
-    trainable_mask = get_trainable_mask(model)
+    trainable_mask = get_trainable_mask(model, abstract=True)
     params, _ = eqx.partition(model, trainable_mask)
 
     wd_mask = get_weight_decay_mask(params)
-    optimizer = hydra.utils.instantiate(cfg.optim, mask=wd_mask)
-
+    schedule = hydra.utils.instantiate(cfg.optim)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(cfg.train.max_grad),
+        optax.adamw(
+            learning_rate=schedule,
+            eps=1e-15,
+            weight_decay=cfg.train.weight_decay,
+            mask=wd_mask,
+        ),
+    )
     opt_state = optimizer.init(params)
 
-    # Place the VAE on CPU so it doesn't consume GPU VRAM.
-    vae = hydra.utils.instantiate(cfg.vae).to("cpu")
-
-    state = (model, opt_state)
-    state = eqx.filter_shard(state, model_sharding)
-
-    model_ema = eqx.filter_shard(model_ema, model_sharding)
-
+    # restoration logic
     step_start = 0
-    if checkpoint_manager.latest_step() is not None:
+    if checkpoint_manager.latest_step() is not None and cfg.train.is_restore:
+
+        state = (model, opt_state)
+
+        abstract_state = jax.tree_util.tree_map(
+            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=cpu_sharding),
+            state,
+        )
+
+        abstract_model = jax.tree_util.tree_map(
+            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=cpu_sharding),
+            model,
+        )
+
+        del state
+        del model
+        del opt_state
+
         print(
             f"Restoring previous trianing at step {checkpoint_manager.latest_step()}/{cfg.train.total_steps}"
         )
-        restore_args = orbax.checkpoint.args.Composite(
-            model=orbax.checkpoint.args.StandardRestore(item=state),
-            model_ema=orbax.checkpoint.args.StandardRestore(item=model_ema),
+        restore_args = ocp.args.Composite(
+            model=ocp.args.StandardRestore(abstract_state),
+            model_ema=ocp.args.StandardRestore(abstract_model),
             dataset=grain.PyGrainCheckpointRestore(data_iterator),
         )
         restored = checkpoint_manager.restore(
             checkpoint_manager.latest_step(), args=restore_args
         )
+
         state = restored["model"]
         model_ema = restored["model_ema"]
+
+        state = jax.tree_util.tree_map(
+            lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x, state
+        )
+        model_ema = jax.tree_util.tree_map(
+            lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x,
+            model_ema,
+        )
+
         step_start = checkpoint_manager.latest_step()
+
+        del restored
+    else:
+        model_ema = jax.tree_util.tree_map(
+            lambda x: jnp.copy(x) if eqx.is_inexact_array(x) else x, model
+        )
+        state = (model, opt_state)
+        state = eqx.filter_shard(state, model_sharding)
+        model_ema = eqx.filter_shard(model_ema, model_sharding)
+
+    vae = hydra.utils.instantiate(cfg.vae).to("cpu")
 
     train(
         state,
