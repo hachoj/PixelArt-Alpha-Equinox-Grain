@@ -31,7 +31,7 @@ def ema_scheduler(decay, init_decay, step, warmup_steps):
         return ((decay - init_decay) / warmup_steps) * step + init_decay
 
 
-@eqx.filter_jit
+@eqx.filter_jit(donate="all")
 def update_ema(model_ema, model_train, decay):
     mask = get_trainable_mask(model_ema)
     params_ema, static_ema = eqx.partition(model_ema, mask)
@@ -414,7 +414,7 @@ def main(cfg: DictConfig):
             checkpoint_manager.latest_step(), args=restore_args
         )
 
-        state = restored["model"]
+        state = restored["state"]
         model_ema = restored["model_ema"]
 
         state = jax.tree_util.tree_map(

@@ -28,8 +28,6 @@ class QKNormedAttention(eqx.Module):
         query_head_dim = query_dim // num_heads
         key_head_dim = key_dim // num_heads
 
-        self.key_size = key_dim // num_heads
-
         key1, key2, key3, key4 = jr.split(key, 4)
 
         self.q_proj = eqx.nn.Linear(query_dim, query_dim, key=key1, dtype=dtype)

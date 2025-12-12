@@ -75,6 +75,8 @@ class DiT(eqx.Module):
     cond_proj: eqx.nn.Embedding
     time_proj: SinusoidalTimeEmbedding
     linear_out: eqx.nn.Linear
+    adaLN1: eqx.nn.Linear
+    adaLN2: eqx.nn.Linear
     pos_embed: SinusoidalPosEmbed
     p: int = eqx.field(static=True)
 
@@ -91,7 +93,7 @@ class DiT(eqx.Module):
         base_image_size,
         key: PRNGKeyArray,
     ):
-        key1, key2, key3, key4 = jr.split(key, 4)
+        key1, key2, key3, key4, key5, key6 = jr.split(key, 6)
 
         self.patchify = eqx.nn.Conv2d(
             in_dim,
@@ -111,13 +113,21 @@ class DiT(eqx.Module):
             for i in range(num_blocks)
         ]
 
-        self.layer_norm = eqx.nn.LayerNorm(dim)
+        self.layer_norm = eqx.nn.LayerNorm(dim, use_bias=False, use_weight=False)
 
         reshape_dim = in_dim * patch_size**2
         self.linear_out = eqx.nn.Linear(dim, reshape_dim, key=key4)
         self.p = patch_size
 
         self.pos_embed = SinusoidalPosEmbed(dim, base_image_size, patch_size)
+
+        self.adaLN1 = eqx.nn.Linear(cond_dim, dim, key=key5)
+        adaLN2_temp = eqx.nn.Linear(dim, dim * 2, key=key6)
+        adaLN_w = jnp.zeros_like(adaLN2_temp.weight)
+        adaLN_b = jnp.zeros_like(adaLN2_temp.bias)  # pyrefly:ignore
+        self.adaLN2 = eqx.tree_at(
+            lambda l: (l.weight, l.bias), adaLN2_temp, (adaLN_w, adaLN_b)
+        )
 
     def __call__(
         self,
@@ -146,6 +156,14 @@ class DiT(eqx.Module):
             # x = eqx.filter_checkpoint(block)(x, time_embed, class_embed)
 
         x = jax.vmap(self.layer_norm)(x)
+        cond = time_embed + class_embed
+
+        cond = self.adaLN1(cond)
+        cond = jax.nn.silu(cond)
+        cond = self.adaLN2(cond)
+        gamma, beta = jnp.split(cond, 2, axis=0)
+
+        x = x * (1 + gamma) + beta
 
         # [N,C] -> [N,p*p*in_dim]
         x = jax.vmap(self.linear_out)(x)

@@ -1,7 +1,7 @@
 import optax
 
 
-def build_optimizer(lr, max_grad, warmup_steps, weight_decay):
+def build_scheduler(lr, warmup_steps):
     schedule = optax.join_schedules(
         schedules=[
             optax.linear_schedule(

@@ -29,5 +29,5 @@ class MHSA(eqx.Module):
         residual = x
         x = jax.vmap(self.layer_norm)(x)
         x = x * (1 + gamma) + beta
-        x = self.attention(x, x, x)
+        x = self.attention(query=x, key=x, value=x)
         return alpha * x + residual

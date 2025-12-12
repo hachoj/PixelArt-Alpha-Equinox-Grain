@@ -1,4 +1,4 @@
-total_steps: 500000
+total_steps: 300000
 batch_size: 1024
 every_n_steps: 10
 every_n_image: 5000
@@ -17,4 +17,4 @@ warmup_steps: 2000
 weight_decay: 0.03
 latent_mean: 0.177456
 
-is_restore: True
+is_restore: False
