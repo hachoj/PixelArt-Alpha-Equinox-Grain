@@ -15,7 +15,12 @@ class MHSA(eqx.Module):
         assert dim % num_heads == 0, "Dimension must be divisible by num_heads"
         self.layer_norm = eqx.nn.LayerNorm(dim, use_weight=False, use_bias=False)
         self.attention = QKNormedAttention(
-            num_heads=num_heads, query_dim=dim, key_dim=dim, key=key
+            num_heads=num_heads,
+            in_key_dim=dim,
+            in_query_dim=dim,
+            query_dim=dim,
+            key_dim=dim,
+            key=key,
         )
 
     def __call__(

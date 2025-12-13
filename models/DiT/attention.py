@@ -17,7 +17,17 @@ class QKNormedAttention(eqx.Module):
     q_norm: eqx.nn.RMSNorm
     k_norm: eqx.nn.RMSNorm
 
-    def __init__(self, num_heads, query_dim, key_dim, key, dtype=None):
+    def __init__(
+        self,
+        num_heads,
+        in_query_dim,
+        in_key_dim,
+        query_dim,
+        key_dim,
+        key,
+        zero_out=False,
+        dtype=None,
+    ):
         assert (
             query_dim % num_heads == 0
         ), "Key dimension must be divisible by num_heads"
@@ -30,13 +40,20 @@ class QKNormedAttention(eqx.Module):
 
         key1, key2, key3, key4 = jr.split(key, 4)
 
-        self.q_proj = eqx.nn.Linear(query_dim, query_dim, key=key1, dtype=dtype)
-        self.k_proj = eqx.nn.Linear(key_dim, key_dim, key=key2, dtype=dtype)
-        self.v_proj = eqx.nn.Linear(key_dim, key_dim, key=key3, dtype=dtype)
+        self.q_proj = eqx.nn.Linear(in_query_dim, query_dim, key=key1, dtype=dtype)
+        self.k_proj = eqx.nn.Linear(in_key_dim, key_dim, key=key2, dtype=dtype)
+        self.v_proj = eqx.nn.Linear(in_key_dim, key_dim, key=key3, dtype=dtype)
         self.out_proj = eqx.nn.Linear(query_dim, query_dim, key=key4, dtype=dtype)
 
         self.q_norm = eqx.nn.RMSNorm(query_head_dim, dtype=dtype)
         self.k_norm = eqx.nn.RMSNorm(key_head_dim, dtype=dtype)
+
+        if zero_out:
+            out_w = jnp.zeros_like(self.out_proj.weight)
+            out_b = jnp.zeros_like(self.out_proj.bias)  # pyrefly:ignore
+            self.out_proj = eqx.tree_at(
+                lambda l: (l.weight, l.bais), self.out_proj, (out_w, out_b)
+            )
 
     def __call__(
         self,
