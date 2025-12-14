@@ -1,5 +1,7 @@
 BATCH_SIZE = 384
+# BATCH_SIZE = 256
 
+import gc
 from datasets import IterableDataset, load_dataset
 from torch.utils.data import DataLoader
 import torchvision.transforms.v2 as v2
@@ -11,11 +13,10 @@ from prompt import prompt  # pyrefly:ignore
 
 from diffusers.models import AutoencoderKL
 from transformers import (
-    Qwen3VLMoeForConditionalGeneration,
+    # Qwen3VLMoeForConditionalGeneration,
     Qwen3VLForConditionalGeneration,
     AutoProcessor,
 )
-import torchvision.transforms.functional as TF
 
 
 import argparse
@@ -36,11 +37,19 @@ def serialize(mean, short_caption, long_caption):
     return record
 
 
+print("Creaing VAE...")
+
 vae = AutoencoderKL.from_pretrained(
     "stabilityai/stable-diffusion-3-medium-diffusers",
     subfolder="vae",
     torch_dtype=torch.bfloat16,
 ).to(device="cuda")
+
+print("VAE Created")
+
+print("------------------------------------")
+
+print("Creating Qwen...")
 
 model_name = "Qwen/Qwen3-VL-2B-Instruct"
 
@@ -51,6 +60,10 @@ qwen = Qwen3VLForConditionalGeneration.from_pretrained(
     attn_implementation="flash_attention_2",
     device_map="cuda",
 )
+
+print("Qwen Created")
+
+print("------------------------------------")
 
 transform_latent = v2.Compose(
     [
@@ -81,9 +94,15 @@ def preprocess(batch) -> dict[str, list[Tensor] | list[str]]:
     return {"latent_img": latent_tensor, "img": qwen_tensor, "caption": caption}
 
 
+print("Building Dataset...")
+
 ds: IterableDataset = load_dataset(  # pyrefly:ignore
     "common-canvas/commoncatalog-cc-by", streaming=True, split="train"
 )
+
+print("Built Dataset")
+
+print("------------------------------------")
 
 cols_to_keep = ["latent_img", "img", "caption"]
 cols_to_remove = [c for c in ds.column_names if c not in cols_to_keep]  # pyrefly:ignore
@@ -91,6 +110,7 @@ cols_to_remove = [c for c in ds.column_names if c not in cols_to_keep]  # pyrefl
 ds = ds.map(
     preprocess,
     batched=True,
+    batch_size=BATCH_SIZE,
     remove_columns=cols_to_remove,
 )
 
@@ -101,9 +121,9 @@ ds = split_dataset_by_node(ds, rank=args.rank, world_size=args.world_size)
 dataloader = DataLoader(
     ds,  # pyrefly:ignore
     batch_size=BATCH_SIZE,
-    num_workers=0,
+    num_workers=4,
     pin_memory=False,
-    prefetch_factor=None,
+    prefetch_factor=2,
 )
 
 import time
@@ -114,11 +134,16 @@ import pickle
 path = f"common_canvas_{args.rank}.array_record"
 writer = array_record_module.ArrayRecordWriter(path, "group_size:1")
 
+print("Processing Data...")
+
 total = 14581672 // args.world_size // BATCH_SIZE
 record_count = 0
 last_10_times = []
+start_time = time.time()
 for i, data in enumerate(dataloader):
-    start_time = time.time()
+    load_end = time.time()
+    load_duration = load_end - start_time
+
     latent_tensor = data["latent_img"]
     qwen_tensor = data["img"]
     captions = data["caption"]
@@ -179,12 +204,40 @@ for i, data in enumerate(dataloader):
         writer.write(pickle.dumps(record))
         record_count += 1
 
+    del (  # pyrefly:ignore
+        inputs,
+        generated_ids,
+        generated_ids_trimmed,
+        mean,
+        meanlogvar,
+        latent_inp,
+        imgs,
+        messages,
+        output_text,
+        latent_tensor,
+        qwen_tensor,
+        data,
+        captions,
+    )
+    gc.collect()
+
     percentage = 1 - ((i + 1) / total)
-    last_10_times.append(time.time() - start_time)
+
+    process_end = time.time()
+    process_duration = process_end - load_end
+    total_duration = process_end - start_time
+
+    start_time = process_end
+
+    last_10_times.append(total_duration)
+    if i == 1:
+        last_10_times.pop(0)
     if len(last_10_times) > 10:
         last_10_times.pop(0)
     seconds = int(np.mean(last_10_times) * total * percentage)
-    print(f"{i+1}/{total} | Estimated time remaining: {timedelta(seconds=seconds)}")
+    print(
+        f"{i+1}/{total} | ETA: {timedelta(seconds=seconds)} | Load: {load_duration:.2f}s | Process: {process_duration:.2f}s | Total: {total_duration:.2f}s"
+    )
 
 writer.close()
 print(f"Number of records written to array_record file {path} :" f" {record_count}")

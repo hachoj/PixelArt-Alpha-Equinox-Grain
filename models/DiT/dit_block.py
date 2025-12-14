@@ -36,6 +36,7 @@ class DiTBlock(eqx.Module):
     def __call__(
         self,
         x: Float[Array, "num_patches embed_dim"],
+        text: Float[Array, "num_tokens text_embed_dim"],
         s: Float[Array, "cond_dim"],
     ) -> Float[Array, "num_patches embed_dim"]:
 
@@ -44,5 +45,8 @@ class DiTBlock(eqx.Module):
         )
 
         x = self.attention(x, gamma1, beta1, alpha1)
+
+        x = x + self.cross_attention(query=x, key=text, value=text)
+
         x = self.mlp(x, gamma2, beta2, alpha2)
         return x
