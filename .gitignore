@@ -162,6 +162,16 @@ tb_logs/
 wandb/
 .wandb/
 
+# Kaggle
+kaggle/
+.kaggle/
+
+# t5gemma
+t5gemma/
+
+0new_model/
+scripts/
+
 # Data files (large datasets)
 data/**/*.array_record
 data/**/*.tfrecord
@@ -170,6 +180,8 @@ data/**/*.parquet
 data/**/*.arrow
 data/**/*.h5
 data/**/*.hdf5
+data/common/
+data/datasets/
 *.data
 *.idx
 

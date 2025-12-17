@@ -1,7 +1,10 @@
-BATCH_SIZE = 384
-# BATCH_SIZE = 256
+import time
 
-import gc
+big_start = time.time()
+
+BATCH_SIZE = 256
+
+
 from datasets import IterableDataset, load_dataset
 from torch.utils.data import DataLoader
 import torchvision.transforms.v2 as v2
@@ -18,7 +21,7 @@ from transformers import (
     AutoProcessor,
 )
 
-
+import gc
 import argparse
 
 parser = argparse.ArgumentParser()
@@ -37,19 +40,11 @@ def serialize(mean, short_caption, long_caption):
     return record
 
 
-print("Creaing VAE...")
-
 vae = AutoencoderKL.from_pretrained(
     "stabilityai/stable-diffusion-3-medium-diffusers",
     subfolder="vae",
     torch_dtype=torch.bfloat16,
 ).to(device="cuda")
-
-print("VAE Created")
-
-print("------------------------------------")
-
-print("Creating Qwen...")
 
 model_name = "Qwen/Qwen3-VL-2B-Instruct"
 
@@ -61,9 +56,6 @@ qwen = Qwen3VLForConditionalGeneration.from_pretrained(
     device_map="cuda",
 )
 
-print("Qwen Created")
-
-print("------------------------------------")
 
 transform_latent = v2.Compose(
     [
@@ -71,7 +63,7 @@ transform_latent = v2.Compose(
         v2.Resize(256),
         v2.CenterCrop(256),
         v2.ToImage(),
-        v2.ToDtype(torch.bfloat16, scale=True),
+        v2.ToDtype(torch.uint8, scale=True),
     ]  # pyrefly:ignore
 )
 
@@ -82,27 +74,32 @@ transform_qwen = v2.Compose(
         v2.Resize(512),
         v2.CenterCrop(512),
         v2.ToImage(),
-        v2.ToDtype(torch.bfloat16, scale=False),
+        v2.ToDtype(torch.uint8, scale=False),
     ]  # pyrefly:ignore
 )
 
 
 def preprocess(batch) -> dict[str, list[Tensor] | list[str]]:
+    import os
+    import psutil
+
+    process = psutil.Process(os.getpid())
+    mem_gb = process.memory_info().rss / (1024 * 1024 * 1024)
+    print(f"Worker {os.getpid()} RAM: {mem_gb:.2f} GB")
+
     latent_tensor: list[Tensor] = [transform_latent(img) for img in batch["jpg"]]
     qwen_tensor: list[Tensor] = [transform_qwen(img) for img in batch["jpg"]]
     caption: list[str] = batch.get("blip2_caption")
+
+    gc.collect()
+
     return {"latent_img": latent_tensor, "img": qwen_tensor, "caption": caption}
 
-
-print("Building Dataset...")
 
 ds: IterableDataset = load_dataset(  # pyrefly:ignore
     "common-canvas/commoncatalog-cc-by", streaming=True, split="train"
 )
 
-print("Built Dataset")
-
-print("------------------------------------")
 
 cols_to_keep = ["latent_img", "img", "caption"]
 cols_to_remove = [c for c in ds.column_names if c not in cols_to_keep]  # pyrefly:ignore
@@ -121,7 +118,7 @@ ds = split_dataset_by_node(ds, rank=args.rank, world_size=args.world_size)
 dataloader = DataLoader(
     ds,  # pyrefly:ignore
     batch_size=BATCH_SIZE,
-    num_workers=4,
+    num_workers=1,
     pin_memory=False,
     prefetch_factor=2,
 )
@@ -130,17 +127,18 @@ import time
 from datetime import timedelta
 from array_record.python import array_record_module  # pyrefly:ignore
 import pickle
+import psutil
+import os
 
-path = f"common_canvas_{args.rank}.array_record"
+path = f"data/common/common_canvas_{args.rank}.array_record"
 writer = array_record_module.ArrayRecordWriter(path, "group_size:1")
 
-print("Processing Data...")
 
-total = 14581672 // args.world_size // BATCH_SIZE
 record_count = 0
 last_10_times = []
 start_time = time.time()
 for i, data in enumerate(dataloader):
+    print(f"Main process: Got batch {i}")
     load_end = time.time()
     load_duration = load_end - start_time
 
@@ -148,8 +146,8 @@ for i, data in enumerate(dataloader):
     qwen_tensor = data["img"]
     captions = data["caption"]
 
-    latent_inp = latent_tensor.to(device=vae.device)
-    imgs = qwen_tensor
+    latent_inp = latent_tensor.to(device=vae.device, dtype=torch.bfloat16).div(255.0)
+    imgs = [img.to(dtype=torch.bfloat16) for img in qwen_tensor]
 
     messages = [
         [
@@ -186,6 +184,7 @@ for i, data in enumerate(dataloader):
             top_k=20,
             max_new_tokens=300,
         )
+    print(f"Main process: Inference done for batch {i}")
 
     mean_np = mean.detach().cpu().numpy()
 
@@ -221,8 +220,6 @@ for i, data in enumerate(dataloader):
     )
     gc.collect()
 
-    percentage = 1 - ((i + 1) / total)
-
     process_end = time.time()
     process_duration = process_end - load_end
     total_duration = process_end - start_time
@@ -234,10 +231,25 @@ for i, data in enumerate(dataloader):
         last_10_times.pop(0)
     if len(last_10_times) > 10:
         last_10_times.pop(0)
-    seconds = int(np.mean(last_10_times) * total * percentage)
+
+    mem_info = ""
+    process = psutil.Process(os.getpid())
+    mem_gb = process.memory_info().rss / (1024 * 1024 * 1024)
+
+    # Get memory of all children (workers)
+    children = process.children(recursive=True)
+    workers_mem = sum([child.memory_info().rss for child in children]) / (
+        1024 * 1024 * 1024
+    )
+    total_mem = mem_gb + workers_mem
+
+    mem_info = f" | Main: {mem_gb:.2f} GB | Workers: {workers_mem:.2f} GB | Total: {total_mem:.2f} GB"
+
     print(
-        f"{i+1}/{total} | ETA: {timedelta(seconds=seconds)} | Load: {load_duration:.2f}s | Process: {process_duration:.2f}s | Total: {total_duration:.2f}s"
+        f"{i+1}/? | ETA: ? | Load: {load_duration:.2f}s | Process: {process_duration:.2f}s | Total: {total_duration:.2f}s{mem_info}"
     )
 
 writer.close()
 print(f"Number of records written to array_record file {path} :" f" {record_count}")
+
+print(f"Overall it took {(time.time() - big_start):.2f}s")

@@ -72,11 +72,12 @@ class DiT(eqx.Module):
     dit_blocks: list[DiTBlock]
     layer_norm: eqx.nn.LayerNorm
     patchify: eqx.nn.Conv2d
-    cond_proj: eqx.nn.Embedding
     time_proj: SinusoidalTimeEmbedding
     linear_out: eqx.nn.Linear
     adaLN1: eqx.nn.Linear
     adaLN2: eqx.nn.Linear
+    adaLN1_single: eqx.nn.Linear
+    adaLN2_single: eqx.nn.Linear
     pos_embed: SinusoidalPosEmbed
     p: int = eqx.field(static=True)
 
@@ -85,15 +86,15 @@ class DiT(eqx.Module):
         in_dim,
         dim,
         cond_dim,
+        text_dim,
         num_heads,
         mlp_ratio,
         num_blocks,
         patch_size,
-        num_classes,
         base_image_size,
         key: PRNGKeyArray,
     ):
-        key1, key2, key3, key4, key5, key6 = jr.split(key, 6)
+        key1, key3, key4, key5, key6, key7, key8 = jr.split(key, 7)
 
         self.patchify = eqx.nn.Conv2d(
             in_dim,
@@ -104,12 +105,11 @@ class DiT(eqx.Module):
             key=key1,
         )
 
-        self.cond_proj = eqx.nn.Embedding(num_classes, cond_dim, key=key2)
         self.time_proj = SinusoidalTimeEmbedding(cond_dim)
 
         dit_keys = jr.split(key3, num_blocks)
         self.dit_blocks = [
-            DiTBlock(dim, cond_dim, num_heads, mlp_ratio, key=dit_keys[i])
+            DiTBlock(dim, text_dim, num_heads, mlp_ratio, key=dit_keys[i])
             for i in range(num_blocks)
         ]
 
@@ -129,11 +129,14 @@ class DiT(eqx.Module):
             lambda l: (l.weight, l.bias), adaLN2_temp, (adaLN_w, adaLN_b)
         )
 
+        self.adaLN1_single = eqx.nn.Linear(cond_dim, dim, key=key7)
+        self.adaLN2_single = eqx.nn.Linear(dim, dim * 6, key=key8)
+
     def __call__(
         self,
         x: Float[Array, "in_dim height width"],
         t: Float[Array, ""],
-        label: Int[Array, ""],
+        text_tokens: Float[Array, "text_embed_dim"],
     ) -> Float[Array, "in_dim height width"]:
         _, H, W = x.shape
         p = self.p
@@ -141,7 +144,6 @@ class DiT(eqx.Module):
         w = W // p
 
         time_embed = self.time_proj(t)
-        class_embed = self.cond_proj(label)
 
         # [in_dim,H,W] -> [C,N]  N:=(H//P)(W//P)
         x = self.patchify(x)
@@ -149,14 +151,17 @@ class DiT(eqx.Module):
 
         x = x + self.pos_embed(h, w)
 
+        sbar = self.adaLN1_single(time_embed)
+        sbar = self.adaLN2_single(sbar)
+
         for block in self.dit_blocks:
-            x = block(x, time_embed, class_embed)
+            x = block(x, text_tokens, sbar)
 
             # use this below if I need more VRAM capacity
             # x = eqx.filter_checkpoint(block)(x, time_embed, class_embed)
 
         x = jax.vmap(self.layer_norm)(x)
-        cond = time_embed + class_embed
+        cond = time_embed
 
         cond = self.adaLN1(cond)
         cond = jax.nn.silu(cond)

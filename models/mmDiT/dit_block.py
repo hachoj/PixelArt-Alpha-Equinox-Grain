@@ -13,11 +13,11 @@ from .attention import QKNormedAttention
 class DiTBlock(eqx.Module):
     mlp: MLP
     attention: MHSA
-    adaLN: jnp.Array
-    corss_attention: QKNormedAttention
+    adaLN: Array
+    cross_attention: QKNormedAttention
 
     def __init__(self, dim, text_dim, num_heads, mlp_ratio, key: PRNGKeyArray):
-        key1, key2, key3, key4, key5 = jr.split(key, 5)
+        key1, key2, key3, key4, key5, key6 = jr.split(key, 6)
 
         self.attention = MHSA(dim, num_heads, key=key1)
         self.cross_attention = QKNormedAttention(
@@ -31,22 +31,22 @@ class DiTBlock(eqx.Module):
         )
         self.mlp = MLP(dim, mlp_ratio, key=key2)
 
-        self.adaLN = jnp.Array(dim * 6)
+        self.adaLN = jax.random.normal(key6, dim * 6)
 
     def __call__(
         self,
         x: Float[Array, "num_patches embed_dim"],
-        text: Float[Array, "num_tokens text_embed_dim"],
-        s: Float[Array, "cond_dim"],
+        text_tokens: Float[Array, "num_tokens text_embed_dim"],
+        sbar: Float[Array, "cond_dim"],
     ) -> Float[Array, "num_patches embed_dim"]:
 
         gamma1, beta1, gamma2, beta2, alpha1, alpha2 = jnp.split(
-            self.adaLN + s, 6, axis=0
+            self.adaLN + sbar, 6, axis=0
         )
 
         x = self.attention(x, gamma1, beta1, alpha1)
 
-        x = x + self.cross_attention(query=x, key=text, value=text)
+        x = x + self.cross_attention(query=x, key=text_tokens, value=text_tokens)
 
         x = self.mlp(x, gamma2, beta2, alpha2)
         return x

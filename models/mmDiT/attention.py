@@ -52,7 +52,7 @@ class QKNormedAttention(eqx.Module):
             out_w = jnp.zeros_like(self.out_proj.weight)
             out_b = jnp.zeros_like(self.out_proj.bias)  # pyrefly:ignore
             self.out_proj = eqx.tree_at(
-                lambda l: (l.weight, l.bais), self.out_proj, (out_w, out_b)
+                lambda l: (l.weight, l.bias), self.out_proj, (out_w, out_b)
             )
 
     def __call__(

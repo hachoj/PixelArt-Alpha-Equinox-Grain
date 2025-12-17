@@ -1,0 +1,5 @@
+_target_: data.data.create_dataloader_stage_2
+file_path: [data/datasets/cc_0.array_record, data/datasets/cc_1.array_record]
+num_workers: 32
+batch_size: ${train.batch_size}
+seed: ${train.seed}
