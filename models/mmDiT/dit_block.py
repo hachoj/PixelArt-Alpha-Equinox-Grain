@@ -2,7 +2,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-from jaxtyping import Array, PRNGKeyArray, Float
+from jaxtyping import Array, PRNGKeyArray, Float, Bool
 from einops import rearrange
 
 from .mhsa import MHSA
@@ -22,9 +22,9 @@ class DiTBlock(eqx.Module):
         self.attention = MHSA(dim, num_heads, key=key1)
         self.cross_attention = QKNormedAttention(
             num_heads=num_heads,
-            in_key_dim=text_dim,
+            in_kv_dim=text_dim,
             in_query_dim=dim,
-            key_dim=dim,
+            kv_dim=dim,
             query_dim=dim,
             key=key5,
             zero_out=True,
@@ -38,6 +38,7 @@ class DiTBlock(eqx.Module):
         x: Float[Array, "num_patches embed_dim"],
         text_tokens: Float[Array, "num_tokens text_embed_dim"],
         sbar: Float[Array, "cond_dim"],
+        text_mask: Bool[Array, "num_tokens"] | None = None,
     ) -> Float[Array, "num_patches embed_dim"]:
 
         gamma1, beta1, gamma2, beta2, alpha1, alpha2 = jnp.split(
@@ -46,7 +47,15 @@ class DiTBlock(eqx.Module):
 
         x = self.attention(x, gamma1, beta1, alpha1)
 
-        x = x + self.cross_attention(query=x, key=text_tokens, value=text_tokens)
+        attn_mask = None
+        if text_mask is not None:
+            attn_mask = jnp.broadcast_to(
+                text_mask[None, :], (x.shape[0], text_mask.shape[0])
+            )
+
+        x = x + self.cross_attention(
+            query=x, key=text_tokens, value=text_tokens, mask=attn_mask
+        )
 
         x = self.mlp(x, gamma2, beta2, alpha2)
         return x

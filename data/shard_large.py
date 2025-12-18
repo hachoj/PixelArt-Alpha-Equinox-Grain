@@ -179,7 +179,7 @@ for i, data in enumerate(dataloader):
         generated_ids = qwen.generate(
             **inputs,
             do_sample=True,
-            temperature=0.3,
+            temperature=0.8,
             top_p=0.8,
             top_k=20,
             max_new_tokens=300,

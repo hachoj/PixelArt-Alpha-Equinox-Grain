@@ -2,7 +2,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-from jaxtyping import Array, PRNGKeyArray, Float, Int
+from jaxtyping import Array, PRNGKeyArray, Float, Int, Bool
 from einops import rearrange
 
 from .dit_block import DiTBlock
@@ -137,6 +137,7 @@ class DiT(eqx.Module):
         x: Float[Array, "in_dim height width"],
         t: Float[Array, ""],
         text_tokens: Float[Array, "text_embed_dim"],
+        text_mask: Bool[Array, "num_tokens"] | None = None,
     ) -> Float[Array, "in_dim height width"]:
         _, H, W = x.shape
         p = self.p
@@ -155,7 +156,7 @@ class DiT(eqx.Module):
         sbar = self.adaLN2_single(sbar)
 
         for block in self.dit_blocks:
-            x = block(x, text_tokens, sbar)
+            x = block(x, text_tokens, sbar, text_mask=text_mask)
 
             # use this below if I need more VRAM capacity
             # x = eqx.filter_checkpoint(block)(x, time_embed, class_embed)

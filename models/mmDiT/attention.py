@@ -2,7 +2,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-from jaxtyping import Array, PRNGKeyArray, Float
+from jaxtyping import Array, Float, Bool
 from einops import rearrange
 
 
@@ -21,9 +21,9 @@ class QKNormedAttention(eqx.Module):
         self,
         num_heads,
         in_query_dim,
-        in_key_dim,
+        in_kv_dim,
         query_dim,
-        key_dim,
+        kv_dim,
         key,
         zero_out=False,
         dtype=None,
@@ -31,18 +31,16 @@ class QKNormedAttention(eqx.Module):
         assert (
             query_dim % num_heads == 0
         ), "Key dimension must be divisible by num_heads"
-        assert (
-            key_dim % num_heads == 0
-        ), "Query dimension must be divisible by num_heads"
+        assert kv_dim % num_heads == 0, "Query dimension must be divisible by num_heads"
         self.num_heads = num_heads
         query_head_dim = query_dim // num_heads
-        key_head_dim = key_dim // num_heads
+        key_head_dim = kv_dim // num_heads
 
         key1, key2, key3, key4 = jr.split(key, 4)
 
         self.q_proj = eqx.nn.Linear(in_query_dim, query_dim, key=key1, dtype=dtype)
-        self.k_proj = eqx.nn.Linear(in_key_dim, key_dim, key=key2, dtype=dtype)
-        self.v_proj = eqx.nn.Linear(in_key_dim, key_dim, key=key3, dtype=dtype)
+        self.k_proj = eqx.nn.Linear(in_kv_dim, kv_dim, key=key2, dtype=dtype)
+        self.v_proj = eqx.nn.Linear(in_kv_dim, kv_dim, key=key3, dtype=dtype)
         self.out_proj = eqx.nn.Linear(query_dim, query_dim, key=key4, dtype=dtype)
 
         self.q_norm = eqx.nn.RMSNorm(query_head_dim, dtype=dtype)
@@ -57,9 +55,10 @@ class QKNormedAttention(eqx.Module):
 
     def __call__(
         self,
-        query: Float[Array, "num_patches embed_dim"],
-        key: Float[Array, "num_patches embed_dim"],
-        value: Float[Array, "num_patches embed_dim"],
+        query: Float[Array, "num_q embed_dim"],
+        key: Float[Array, "num_kv embed_dim"],
+        value: Float[Array, "num_kv embed_dim"],
+        mask: Bool[Array, "num_q num_kv"] | None = None,
     ):
         q = jax.vmap(self.q_proj)(query)
         k = jax.vmap(self.k_proj)(key)
@@ -77,7 +76,8 @@ class QKNormedAttention(eqx.Module):
         q = rearrange(q, "(n h) d -> n h d", h=self.num_heads)
         k = rearrange(k, "(n h) d -> n h d", h=self.num_heads)
 
-        attn_output = jax.nn.dot_product_attention(q, k, v, scale=1.0)
+        # mask shape should be broadcastable to [h, num_query, num_key]
+        attn_output = jax.nn.dot_product_attention(q, k, v, mask=mask, scale=1.0)
 
         attn_output = attn_output.reshape(n, -1)
         out = jax.vmap(self.out_proj)(attn_output)

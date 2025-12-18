@@ -24,6 +24,67 @@ import diffrax
 from einops import rearrange
 import torch
 
+from typing import Union, Sequence
+from jaxtyping import Array, Float, Bool, Int
+
+
+def encode_with_t5gemma_encoder(
+    texts: Union[str, Sequence[str]],
+    *,
+    model,
+    params,
+    tokenizer,
+    max_input_length: int = 256,
+    model_sharding: jshard.NamedSharding,
+    data_sharding: jshard.NamedSharding,
+    return_on_host: bool = True,
+) -> tuple[Float[Array, "batch max_length d_model"], Bool[Array, "batch max_length"]]:
+    if isinstance(texts, str):
+        texts = [texts]
+
+    if hasattr(tokenizer, "special_tokens"):
+        pad_id = tokenizer.special_tokens.PAD
+    else:
+        raise ValueError("Expected PAD token to exist")
+
+    padded_batch = []
+    for text in texts:
+        token_ids = tokenizer.encode(text)[:max_input_length]
+        padded_batch.append(token_ids + [pad_id] * (max_input_length - len(token_ids)))
+
+    input_tokens: Int[Array, "batch max_length"] = jnp.asarray(
+        padded_batch, dtype=jnp.int32
+    )
+
+    # Padding-based mask.
+    inputs_mask: Bool[Array, "batch max_length"] = (
+        input_tokens != pad_id  # pyrefly:ignore
+    )
+
+    def _encoder_last_hidden(params, tokens, mask):
+        encoder_acts = model.apply(
+            {"params": params},
+            tokens=tokens,
+            inputs_mask=mask,
+            method=model.compute_encoder_activations,
+        )
+        return encoder_acts.activations[-1]  # [B, L, d_model]
+
+    params_s = jax.device_put(params, model_sharding)
+    tokens_s = jax.device_put(input_tokens, data_sharding)
+    mask_s = jax.device_put(inputs_mask, data_sharding)
+
+    forward = jax.jit(
+        _encoder_last_hidden,
+        in_shardings=(model_sharding, data_sharding, data_sharding),
+        out_shardings=data_sharding,
+    )
+    encoder_last_hidden = forward(params_s, tokens_s, mask_s)
+    if return_on_host:
+        encoder_last_hidden = jax.device_get(encoder_last_hidden)
+        inputs_mask = jax.device_get(inputs_mask)
+    return encoder_last_hidden, inputs_mask
+
 
 def ema_scheduler(decay, init_decay, step, warmup_steps):
     if step >= warmup_steps:
@@ -53,17 +114,10 @@ def get_trainable_mask(model):
     return mask
 
 
-def get_weight_decay_mask(model):
-    mask = jax.tree_util.tree_map(eqx.is_inexact_array, model)
-
-    mask = eqx.tree_at(lambda m: m.cond_proj.weight, mask, replace=False)
-    return mask
-
-
-def single_sample_fn(model, noise, label):
+def single_sample_fn(model, noise, text_tokens, token_mask):
     def vector_field(t, y, args):
-        model, label = args
-        return model(y, t, label)
+        model, text_tokens, token_mask = args
+        return model(y, t, text_tokens, token_mask)
 
     term = diffrax.ODETerm(vector_field)
 
@@ -80,7 +134,7 @@ def single_sample_fn(model, noise, label):
         t1=1.0,
         dt0=1.0 / num_steps,
         y0=noise,
-        args=(model, label),
+        args=(model, text_tokens, token_mask),
         stepsize_controller=stepsize_controller,
         saveat=diffrax.SaveAt(ts=save_times),
         max_steps=num_steps + 2,
@@ -89,23 +143,39 @@ def single_sample_fn(model, noise, label):
 
 
 @eqx.filter_jit
-def generate_samples(model, noise, labels, model_sharding, data_sharding):
+def generate_samples(
+    model, noise, text_tokens, token_mask, model_sharding, data_sharding
+):
     model = eqx.filter_shard(model, model_sharding)
-    noise, labels = eqx.filter_shard((noise, labels), data_sharding)
-    return jax.vmap(single_sample_fn, in_axes=(None, 0, 0))(model, noise, labels)
+    noise, text_tokens, token_mask = eqx.filter_shard(
+        (noise, text_tokens, token_mask), data_sharding
+    )
+    return jax.vmap(single_sample_fn, in_axes=(None, 0, 0, 0))(
+        model, noise, text_tokens, token_mask
+    )
 
 
 @eqx.filter_value_and_grad
-def compute_grads(params, static, x_t, v, t, labels):
+def compute_grads(params, static, x_t, v, t, text_tokens, token_mask):
     model = eqx.combine(params, static)
 
-    logits = jax.vmap(model)(x_t, t, labels)
+    logits = jax.vmap(model)(x_t, t, text_tokens, token_mask)
     loss = optax.losses.l2_loss(logits, v)
     return jnp.mean(loss)
 
 
 @eqx.filter_jit(donate="all")
-def step_model(state, optimizer, x_t, v, t, labels, model_sharding, data_sharding):
+def step_model(
+    state,
+    optimizer,
+    x_t,
+    v,
+    t,
+    text_tokens,
+    token_mask,
+    model_sharding,
+    data_sharding,
+):
     # you shard again here for XLA efficiency, it doesn't
     # actually divide the shards into smaller "sub-shards"
 
@@ -123,14 +193,19 @@ def step_model(state, optimizer, x_t, v, t, labels, model_sharding, data_shardin
         lambda x: x.astype(jnp.bfloat16) if eqx.is_inexact_array(x) else x, static_fp32
     )
 
-    x_t, v, t, labels = eqx.filter_shard((x_t, v, t, labels), data_sharding)
-    x_t, v, t = (
+    x_t, v, t, text_tokens, token_mask = eqx.filter_shard(
+        (x_t, v, t, text_tokens, token_mask), data_sharding
+    )
+    x_t, v, t, text_tokens = (
         x_t.astype(jnp.bfloat16),
         v.astype(jnp.bfloat16),
         t.astype(jnp.bfloat16),
+        text_tokens.astype(jnp.bfloat16),
     )
 
-    loss, grads = compute_grads(params_bf16, static_bf16, x_t, v, t, labels)
+    loss, grads = compute_grads(
+        params_bf16, static_bf16, x_t, v, t, text_tokens, token_mask
+    )
 
     # use bf16 grads to update fp32 weights since bf16 should be stable enough
     # without the use of grad scaling
@@ -153,6 +228,9 @@ def train(
     data_sharding,
     key,
     checkpoint_manager,
+    t5gemma_model,
+    t5gemma_params,
+    preset,
     step_start=0,
 ):
     if cfg.wandb.enabled:
@@ -172,38 +250,72 @@ def train(
 
     key, sub_key = jr.split(key)
 
+    validation_captions = [
+        "A pixel art character.",
+        "A beautiful landscape.",
+        "A futuristic sci-fi city.",
+        "A red dragon.",
+        "A blue wizard.",
+        "A green forest.",
+        "A dark dungeon.",
+        "A bright sunny day.",
+    ]
+
+    validation_tokens, validation_masks = encode_with_t5gemma_encoder(
+        validation_captions,
+        model=t5gemma_model,
+        params=t5gemma_params,
+        tokenizer=preset.tokenizer,
+        max_input_length=cfg.train.max_input_length,
+        model_sharding=model_sharding,
+        data_sharding=data_sharding,
+        return_on_host=False,  # Keep them on device/sharded
+    )
+
     validation_noise = jax.random.normal(key, shape=(1, 16, 32, 32), dtype=jnp.bfloat16)
     validation_noise = jnp.repeat(validation_noise, repeats=8, axis=0)
-    validation_labels = jnp.array([0, 5, 10, 15, 200, 500, 750, 1000])
-
-    # shard once before the loop since it's reused
     validation_noise = eqx.filter_shard(validation_noise, data_sharding)
-    validation_labels = eqx.filter_shard(validation_labels, data_sharding)
 
     start_time = time.time()
 
-    for step in range(step_start, cfg.train.total_steps):
-        try:
-            batch = next(data_iterator)
-        except StopIteration:
-            break
+    for step in range(step_start, cfg.train.total_steps * cfg.train.gradient_accum):
+        batch = next(data_iterator)
 
         latents = batch["latent"]
-        labels = batch["label"]
+        short_captions = batch["short_caption"]
+        long_captions = batch["long_caption"]
+
+        key, sub_key = jr.split(key)
+
+        indices = jax.random.randint(
+            key,
+            shape=(int(len(short_captions) * cfg.train.short_caption_percent),),
+            minval=0,
+            maxval=len(short_captions),
+        )
+
+        captions = long_captions
+        captions[indices] = short_captions[indices]
+
+        text_tokens, masks = encode_with_t5gemma_encoder(
+            captions,
+            model=t5gemma_model,
+            params=t5gemma_params,
+            tokenizer=preset.tokenizer,
+            max_input_length=cfg.train.max_input_length,
+            model_sharding=model_sharding,
+            data_sharding=data_sharding,
+            return_on_host=False,
+        )
 
         latents = jax.device_put(latents, data_sharding)
-        labels = jax.device_put(labels, data_sharding)
+        text_tokens = jax.device_put(text_tokens, data_sharding)
+        masks = jax.device_put(masks, data_sharding)
 
         # with jax sharding, this still actually prints the global batch size
         B = latents.shape[0]
 
         key, sub_key = jr.split(key)
-
-        # classifier free guidience
-        probs = jnp.array([1 - cfg.train.cfg_p, cfg.train.cfg_p])
-        mask = jr.choice(key, 2, shape=(B,), p=probs)
-
-        labels = jnp.where(mask == 1, 1000, labels)
 
         # X1 inherit the sharding from latents
         X1 = jnp.array(latents, dtype=jnp.int16).view(jnp.bfloat16) * scaling_factor
@@ -232,7 +344,15 @@ def train(
         Xt = t_mult * X1 + (1 - t_mult) * X0
 
         state, loss = step_model(
-            state, optimizer, Xt, X1 - X0, t, labels, model_sharding, data_sharding
+            state,
+            optimizer,
+            Xt,
+            X1 - X0,
+            t,
+            text_tokens,
+            masks,
+            model_sharding,
+            data_sharding,
         )
         model, _opt_state = state
 
@@ -262,7 +382,8 @@ def train(
             generated_latents_ema = generate_samples(
                 model_ema,
                 validation_noise,
-                validation_labels,
+                validation_tokens,
+                validation_masks,
                 model_sharding,
                 data_sharding,
             )
@@ -274,7 +395,8 @@ def train(
             generated_latents_model = generate_samples(
                 model,
                 validation_noise,
-                validation_labels,
+                validation_tokens,
+                validation_masks,
                 model_sharding,
                 data_sharding,
             )
@@ -335,8 +457,11 @@ def train(
                     {f"train/{cfg.train.every_n_image} time": end_time - start_time}
                 )
 
+            caption_text = "EMA | Regular\n" + "\n".join(
+                [f"Row {i}: {c}" for i, c in enumerate(validation_captions)]
+            )
             wandb.log(
-                {"image/examples": wandb.Image(decoded_images, caption="EMA | Regular")}
+                {"image/examples": wandb.Image(decoded_images, caption=caption_text)}
             )
             start_time = time.time()
 
@@ -348,6 +473,45 @@ def train(
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
+    from jax._src.interpreters.partial_eval import Val
+    import os
+    import jax
+    import jax.numpy as jnp
+    from pathlib import Path
+    from typing import Any, Sequence, Union
+    from jaxtyping import Array, Bool, Float, Int
+    import jax.sharding as jshard
+
+    # This was some HPC issue that I had no idea what it was
+    # Thanks Gemini 3.0 Pro for fixing it lol
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        ca_bundle = Path(conda_prefix) / "ssl" / "cacert.pem"
+        if ca_bundle.exists():
+            os.environ.setdefault("SSL_CERT_FILE", str(ca_bundle))
+            os.environ.setdefault("CURL_CA_BUNDLE", str(ca_bundle))
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", str(ca_bundle))
+            print("Using CA bundle:", ca_bundle)
+        else:
+            print("Conda CA bundle not found at:", ca_bundle)
+    else:
+        print("CONDA_PREFIX not set; leaving SSL cert settings unchanged.")
+
+    CKPT_DIR = Path("/home/chojnowski.h/weishao/chojnowski.h/JaxFM/t5gemma")
+    assert CKPT_DIR.exists(), f"Checkpoint folder not found: {CKPT_DIR}"
+    print("Using checkpoint:", CKPT_DIR)
+
+    from gemma import gm
+    from gemma.research import t5gemma
+
+    preset = t5gemma.T5GemmaPreset.GEMMA2_XL_XL
+    t5gemma_model = preset.config.make("transformer")
+
+    t5gemma_params = gm.ckpts.load_params(CKPT_DIR)
+
+    if "decoder" in t5gemma_params:
+        del t5gemma_params["decoder"]  # pyrefly:ignore
+
     devices = jax.devices()
     mesh = jshard.Mesh(devices, axis_names=("data",))
 
@@ -370,7 +534,6 @@ def main(cfg: DictConfig):
     trainable_mask = get_trainable_mask(model)
     params, _ = eqx.partition(model, trainable_mask)
 
-    wd_mask = get_weight_decay_mask(params)
     schedule = hydra.utils.instantiate(cfg.optim)
     optimizer = optax.chain(
         optax.clip_by_global_norm(cfg.train.max_grad),
@@ -378,21 +541,62 @@ def main(cfg: DictConfig):
             learning_rate=schedule,
             eps=1e-15,
             weight_decay=cfg.train.weight_decay,
-            mask=wd_mask,
         ),
     )
     opt_state = optimizer.init(params)
 
     # restoration logic
     step_start = 0
-    if checkpoint_manager.latest_step() is not None and not cfg.train.is_restore:
-        ckpt_dir = os.path.abspath(cfg.train.checkpoint_init_dir)
-        options = ocp.CheckpointManagerOptions(max_to_keep=5, create=True)
-        checkpoint_manager = ocp.CheckpointManager(
-            ckpt_dir, options=options, item_names=("state", "model_ema", "dataset")
+    if not cfg.train.is_restore:
+        ckpt_dir_new = os.path.abspath(cfg.train.checkpoint_init_dir)
+        options = ocp.CheckpointManagerOptions(max_to_keep=1, create=True)
+        initial_mngr = ocp.CheckpointManager(
+            ckpt_dir_new, options=options, item_names=("model",)
         )
-        initial_mngr = 
 
+        abstract_model = jax.tree_util.tree_map(
+            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=cpu_sharding),
+            model,
+        )
+
+        del model
+
+        print("Loading reparameterized model...")
+        restore_args = ocp.args.Composite(
+            model=ocp.args.StandardRestore(abstract_model),
+        )
+        restored = initial_mngr.restore(0, args=restore_args)
+
+        model = restored["model"]
+
+        model = jax.tree_util.tree_map(
+            lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x,
+            model,
+        )
+
+        # Ensure optimizer state matches the restored parameters.
+        trainable_mask = get_trainable_mask(model)
+        params, _ = eqx.partition(model, trainable_mask)
+        opt_state = optimizer.init(params)
+
+        state = (model, opt_state)
+        model_ema = jax.tree_util.tree_map(
+            lambda x: jnp.copy(x) if eqx.is_inexact_array(x) else x, model
+        )
+
+        state = jax.tree_util.tree_map(
+            lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x,
+            state,
+        )
+        model_ema = jax.tree_util.tree_map(
+            lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x,
+            model_ema,
+        )
+
+        step_start = 0
+
+        del restored
+    elif checkpoint_manager.latest_step() is not None and cfg.train.is_restore:
         state = (model, opt_state)
 
         abstract_state = jax.tree_util.tree_map(
@@ -425,7 +629,8 @@ def main(cfg: DictConfig):
         model_ema = restored["model_ema"]
 
         state = jax.tree_util.tree_map(
-            lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x, state
+            lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x,
+            state,
         )
         model_ema = jax.tree_util.tree_map(
             lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x,
@@ -435,13 +640,6 @@ def main(cfg: DictConfig):
         step_start = checkpoint_manager.latest_step()
 
         del restored
-    elif checkpoint_manager.latest_step() is not None and cfg.train.is_restore:
-        model_ema = jax.tree_util.tree_map(
-            lambda x: jnp.copy(x) if eqx.is_inexact_array(x) else x, model
-        )
-        state = (model, opt_state)
-        state = eqx.filter_shard(state, model_sharding)
-        model_ema = eqx.filter_shard(model_ema, model_sharding)
     else:
         return ValueError("Some initial point should be given.")
 
@@ -458,6 +656,9 @@ def main(cfg: DictConfig):
         data_sharding,
         key,
         checkpoint_manager,
+        t5gemma_model,
+        t5gemma_params,
+        preset,
         step_start,
     )
 

@@ -172,6 +172,8 @@ t5gemma/
 0new_model/
 scripts/
 
+.github/
+
 # Data files (large datasets)
 data/**/*.array_record
 data/**/*.tfrecord

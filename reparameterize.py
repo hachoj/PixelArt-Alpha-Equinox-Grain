@@ -28,7 +28,7 @@ def reparameterize(model, E, c, adaln1w, adaln1b, ada1w, ada1b, ada2w, ada2b):
         m.adaLN1_single.weight,
         m.adaLN1_single.bias,
         m.adaLN2_single.weight,
-        m.adaLN1_single.bias,
+        m.adaLN2_single.bias,
     ]
     final_adaln = lambda m: [m.adaLN1.bias]
     new_embeds = lambda m: [block.adaLN for block in m.dit_blocks]
@@ -109,7 +109,7 @@ def main(cfg: DictConfig):
         ckpt_dir, options=options, item_names=("state", "model_ema", "dataset")
     )
 
-    new_ckpt_dir = os.path.abspath("new_model")
+    new_ckpt_dir = os.path.abspath("0new_model")
     new_checkpoint_manager = ocp.CheckpointManager(
         new_ckpt_dir,
         options=ocp.CheckpointManagerOptions(

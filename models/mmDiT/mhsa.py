@@ -16,10 +16,10 @@ class MHSA(eqx.Module):
         self.layer_norm = eqx.nn.LayerNorm(dim, use_weight=False, use_bias=False)
         self.attention = QKNormedAttention(
             num_heads=num_heads,
-            in_key_dim=dim,
+            in_kv_dim=dim,
             in_query_dim=dim,
             query_dim=dim,
-            key_dim=dim,
+            kv_dim=dim,
             key=key,
         )
 
