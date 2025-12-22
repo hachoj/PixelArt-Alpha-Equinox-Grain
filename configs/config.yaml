@@ -4,5 +4,5 @@ defaults:
   - train: stage2
   - vae: vae
   - optim: adamw
-  - wandb: none
+  - wandb: stage2
   - _self_

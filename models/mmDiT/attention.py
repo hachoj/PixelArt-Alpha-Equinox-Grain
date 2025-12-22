@@ -64,10 +64,12 @@ class QKNormedAttention(eqx.Module):
         k = jax.vmap(self.k_proj)(key)
         v = jax.vmap(self.v_proj)(value)
 
-        n, _ = q.shape
-        q = q.reshape(n, self.num_heads, -1)
-        k = k.reshape(n, self.num_heads, -1)
-        v = v.reshape(n, self.num_heads, -1)
+        num_query_tokens, _ = q.shape
+        num_kv_tokens, _ = key.shape
+
+        q = q.reshape(num_query_tokens, self.num_heads, -1)
+        k = k.reshape(num_kv_tokens, self.num_heads, -1)
+        v = v.reshape(num_kv_tokens, self.num_heads, -1)
 
         q = rearrange(q, "n h d -> (n h) d")
         k = rearrange(k, "n h d -> (n h) d")
@@ -79,6 +81,6 @@ class QKNormedAttention(eqx.Module):
         # mask shape should be broadcastable to [h, num_query, num_key]
         attn_output = jax.nn.dot_product_attention(q, k, v, mask=mask, scale=1.0)
 
-        attn_output = attn_output.reshape(n, -1)
+        attn_output = attn_output.reshape(num_query_tokens, -1)
         out = jax.vmap(self.out_proj)(attn_output)
         return out

@@ -1,4 +1,3 @@
-from jax._src.interpreters.partial_eval import Val
 import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -31,13 +30,14 @@ from jaxtyping import Array, Float, Bool, Int
 def encode_with_t5gemma_encoder(
     texts: Union[str, Sequence[str]],
     *,
-    model,
+    model=None,
     params,
     tokenizer,
     max_input_length: int = 256,
     model_sharding: jshard.NamedSharding,
     data_sharding: jshard.NamedSharding,
     return_on_host: bool = True,
+    forward_fn=None,
 ) -> tuple[Float[Array, "batch max_length d_model"], Bool[Array, "batch max_length"]]:
     if isinstance(texts, str):
         texts = [texts]
@@ -57,29 +57,34 @@ def encode_with_t5gemma_encoder(
     )
 
     # Padding-based mask.
-    inputs_mask: Bool[Array, "batch max_length"] = (
-        input_tokens != pad_id  # pyrefly:ignore
-    )
-
-    def _encoder_last_hidden(params, tokens, mask):
-        encoder_acts = model.apply(
-            {"params": params},
-            tokens=tokens,
-            inputs_mask=mask,
-            method=model.compute_encoder_activations,
-        )
-        return encoder_acts.activations[-1]  # [B, L, d_model]
+    inputs_mask: Bool[Array, "batch max_length"] = input_tokens != pad_id
 
     params_s = jax.device_put(params, model_sharding)
     tokens_s = jax.device_put(input_tokens, data_sharding)
     mask_s = jax.device_put(inputs_mask, data_sharding)
 
-    forward = jax.jit(
-        _encoder_last_hidden,
-        in_shardings=(model_sharding, data_sharding, data_sharding),
-        out_shardings=data_sharding,
-    )
-    encoder_last_hidden = forward(params_s, tokens_s, mask_s)
+    if forward_fn is not None:
+        encoder_last_hidden = forward_fn(params_s, tokens_s, mask_s)
+    else:
+        if model is None:
+            raise ValueError("model must be provided if forward_fn is not provided")
+
+        def _encoder_last_hidden(params, tokens, mask):
+            encoder_acts = model.apply(
+                {"params": params},
+                tokens=tokens,
+                inputs_mask=mask,
+                method=model.compute_encoder_activations,
+            )
+            return encoder_acts.activations[-1]  # [B, L, d_model]
+
+        forward = jax.jit(
+            _encoder_last_hidden,
+            in_shardings=(model_sharding, data_sharding, data_sharding),
+            out_shardings=data_sharding,
+        )
+        encoder_last_hidden = forward(params_s, tokens_s, mask_s)
+
     if return_on_host:
         encoder_last_hidden = jax.device_get(encoder_last_hidden)
         inputs_mask = jax.device_get(inputs_mask)
@@ -164,7 +169,9 @@ def compute_grads(params, static, x_t, v, t, text_tokens, token_mask):
     return jnp.mean(loss)
 
 
-@eqx.filter_jit(donate="all")
+@eqx.filter_jit(
+    donate="all",
+)
 def step_model(
     state,
     optimizer,
@@ -175,6 +182,9 @@ def step_model(
     token_mask,
     model_sharding,
     data_sharding,
+    micro_step,
+    grad_accum_steps,
+    gradients,
 ):
     # you shard again here for XLA efficiency, it doesn't
     # actually divide the shards into smaller "sub-shards"
@@ -207,14 +217,35 @@ def step_model(
         params_bf16, static_bf16, x_t, v, t, text_tokens, token_mask
     )
 
+    # Accumulate gradients
+    gradients = eqx.apply_updates(gradients, grads)
+
     # use bf16 grads to update fp32 weights since bf16 should be stable enough
     # without the use of grad scaling
-    updates, opt_state = optimizer.update(grads, opt_state, params=params_fp32)
-    params_fp32 = eqx.apply_updates(params_fp32, updates)
+    def update_step(operands):
+        params_fp32, opt_state, gradients = operands
+        grads = jax.tree_util.tree_map(lambda g: g / grad_accum_steps, gradients)
+        updates, opt_state = optimizer.update(grads, opt_state, params=params_fp32)
+        params_fp32 = eqx.apply_updates(params_fp32, updates)
 
-    model_fp32 = eqx.combine(params_fp32, static_fp32)
+        model_fp32 = eqx.combine(params_fp32, static_fp32)
 
-    return (model_fp32, opt_state), loss
+        zeros = jax.tree_util.tree_map(jnp.zeros_like, gradients)
+        return (model_fp32, opt_state), loss, zeros
+
+    def skip_step(operands):
+        params_fp32, opt_state, gradients = operands
+        model_fp32 = eqx.combine(params_fp32, static_fp32)
+        return (model_fp32, opt_state), loss, gradients
+
+    condition: bool = micro_step >= grad_accum_steps - 1
+    operands = (params_fp32, opt_state, gradients)
+    return jax.lax.cond(
+        condition,
+        update_step,
+        skip_step,
+        operands
+    )
 
 
 def train(
@@ -251,14 +282,14 @@ def train(
     key, sub_key = jr.split(key)
 
     validation_captions = [
-        "A pixel art character.",
-        "A beautiful landscape.",
-        "A futuristic sci-fi city.",
-        "A red dragon.",
-        "A blue wizard.",
-        "A green forest.",
-        "A dark dungeon.",
-        "A bright sunny day.",
+        "A neon-lit vending machine in a dark alley.",
+        "A chrome skull resting on a velvet pillow.",
+        "The rain-slicked pavement of the neon metropolis reflects the holographic advertisements towering above, casting a kaleidoscope of electric blues and violent magentas onto the street. A lone figure in a transparent raincoat stands under a flickering awning, their face obscured by the glow of a datapad. Steam rises from a street vendor’s stall nearby, mingling with the dense fog that clings to the base of the skyscrapers. Drones buzz overhead like angry insects, their red navigation lights cutting through the gloom.",
+        "An ancient oak tree, its bark twisted into spirals of silver and grey, dominates the center of a twilight glade. Bioluminescent mushrooms in shades of teal and violet cling to its massive roots, casting an ethereal upward glow. The air is filled with floating pollen that glimmers like gold dust in the fading light. In the background, jagged crystal spires rise from the mist, piercing the purple sky where three pale moons hang low. A stream of crystal-clear water winds through the foreground, slipping over smooth, moss-covered stones.",
+        "The workshop is a cluttered labyrinth of brass gears, ticking clockwork mechanisms, and scattered blueprints stained with grease. A magnifying glass, mounted on an articulated brass arm, distorts the view of a tiny, mechanical beetle resting on the workbench. Dust motes dance in the shaft of warm, amber light streaming through a circular window, illuminating the particles of sawdust suspended in the air. Shelves line the walls, packed with glass jars containing preserved insects and spare springs.",
+        "A colossal space station shaped like a ring world creates a silhouette against the burning orange curve of a gas giant. Tiny shuttles leave trails of white exhaust as they approach the docking bays, looking like specks of dust against the massive scale of the station. The station’s lights twinkle like diamond dust, contrasting with the deep, velvet black of the surrounding void. A nebula in the distance swirls with hues of deep crimson and indigo, providing a dramatic backdrop to the industrial rigidity of the metal structure.",
+        "A warrior clad in ceremonial armor stands in a snowy courtyard, the metal plates etched with intricate floral patterns that catch the cold winter light. A fur cloak, heavy and textured with frost, drapes over their shoulders. Their eyes are sharp and piercing, reflecting the gray sky, while a scar runs faintly across their cheek. The background is a blur of falling snowflakes and dark pine trees, creating a soft bokeh effect that isolates the figure. The breath of the warrior is visible as a wisp of white vapor.",
+        "A floating island made of melting clocks and marble staircases drifts through a sky of liquid clouds. The staircases lead nowhere, twisting into loops and spirals that defy gravity. A grand piano sits on the edge of a precipice, its keys pouring out water instead of sound, creating a waterfall that cascades into the abyss below. The lighting is surreal, with two light sources casting shadows in opposing directions—one warm and golden, the other cool and teal. Giant butterflies with wings made of stained glass flutter around the piano.",
     ]
 
     validation_tokens, validation_masks = encode_with_t5gemma_encoder(
@@ -276,85 +307,111 @@ def train(
     validation_noise = jnp.repeat(validation_noise, repeats=8, axis=0)
     validation_noise = eqx.filter_shard(validation_noise, data_sharding)
 
+    def _t5_forward(params, tokens, mask):
+        encoder_acts = t5gemma_model.apply(
+            {"params": params},
+            tokens=tokens,
+            inputs_mask=mask,
+            method=t5gemma_model.compute_encoder_activations,
+        )
+        return encoder_acts.activations[-1]
+
+    t5_forward_jit = jax.jit(
+        _t5_forward,
+        in_shardings=(model_sharding, data_sharding, data_sharding),
+        out_shardings=data_sharding,
+    )
+
     start_time = time.time()
 
-    for step in range(step_start, cfg.train.total_steps * cfg.train.gradient_accum):
-        batch = next(data_iterator)
+    model = state[0]
+    mask = get_trainable_mask(model)
+    params, _ = eqx.partition(model, mask)
+    grads = jax.tree_util.tree_map(jnp.zeros_like, params)
+    loss = 0
 
-        latents = batch["latent"]
-        short_captions = batch["short_caption"]
-        long_captions = batch["long_caption"]
+    for step in range(step_start, cfg.train.total_steps):
+        for micro_step in range(cfg.train.gradient_accum):
+            batch = next(data_iterator)
 
-        key, sub_key = jr.split(key)
+            latents = batch["latent"]
+            short_captions = batch["short_caption"]
+            long_captions = batch["long_caption"]
 
-        indices = jax.random.randint(
-            key,
-            shape=(int(len(short_captions) * cfg.train.short_caption_percent),),
-            minval=0,
-            maxval=len(short_captions),
-        )
+            key, sub_key = jr.split(key)
 
-        captions = long_captions
-        captions[indices] = short_captions[indices]
+            indices = jax.random.randint(
+                key,
+                shape=(int(len(short_captions) * cfg.train.short_caption_percent),),
+                minval=0,
+                maxval=len(short_captions),
+            )
 
-        text_tokens, masks = encode_with_t5gemma_encoder(
-            captions,
-            model=t5gemma_model,
-            params=t5gemma_params,
-            tokenizer=preset.tokenizer,
-            max_input_length=cfg.train.max_input_length,
-            model_sharding=model_sharding,
-            data_sharding=data_sharding,
-            return_on_host=False,
-        )
+            captions = long_captions
+            captions[indices] = short_captions[indices]
 
-        latents = jax.device_put(latents, data_sharding)
-        text_tokens = jax.device_put(text_tokens, data_sharding)
-        masks = jax.device_put(masks, data_sharding)
+            text_tokens, masks = encode_with_t5gemma_encoder(
+                captions,
+                model=None,
+                params=t5gemma_params,
+                tokenizer=preset.tokenizer,
+                max_input_length=cfg.train.max_input_length,
+                model_sharding=model_sharding,
+                data_sharding=data_sharding,
+                return_on_host=False,
+                forward_fn=t5_forward_jit,
+            )
 
-        # with jax sharding, this still actually prints the global batch size
-        B = latents.shape[0]
+            latents = jax.device_put(latents, data_sharding)
+            text_tokens = jax.device_put(text_tokens, data_sharding)
+            masks = jax.device_put(masks, data_sharding)
 
-        key, sub_key = jr.split(key)
+            # with jax sharding, this still actually prints the global batch size
+            B = latents.shape[0]
 
-        # X1 inherit the sharding from latents
-        X1 = jnp.array(latents, dtype=jnp.int16).view(jnp.bfloat16) * scaling_factor
+            key, sub_key = jr.split(key)
 
-        if not jnp.all(jnp.isfinite(X1)):
-            print(f"Skipping step {step}: NaN detected in latents")
-            continue
+            # X1 inherit the sharding from latents
+            X1 = jnp.array(latents, dtype=jnp.int16).view(jnp.bfloat16) * scaling_factor
 
-        X1 = X1 - cfg.train.latent_mean
+            if not jnp.all(jnp.isfinite(X1)):
+                print(f"Skipping step {step}: NaN detected in latents")
+                continue
 
-        key, sub_key = jr.split(key)
-        # because jax sharding treats the shape as if it were on one GIGA-GPU
-        # I have to reshard this
-        X0 = jax.random.normal(key, shape=X1.shape, dtype=X1.dtype)
-        X0 = jax.device_put(X0, data_sharding)
+            X1 = X1 - cfg.train.latent_mean
 
-        # and the same idea for X0 is needed here
-        key, sub_key = jr.split(key)
-        eps = jax.random.normal(key, shape=[B])
-        eps = jax.device_put(eps, data_sharding)
+            key, sub_key = jr.split(key)
+            # because jax sharding treats the shape as if it were on one GIGA-GPU
+            # I have to reshard this
+            X0 = jax.random.normal(key, shape=X1.shape, dtype=X1.dtype)
+            X0 = jax.device_put(X0, data_sharding)
 
-        # t inherits the sharding from eps
-        t = jax.nn.sigmoid(eps)
-        t_mult = t[:, None, None, None]
+            # and the same idea for X0 is needed here
+            key, sub_key = jr.split(key)
+            eps = jax.random.normal(key, shape=[B])
+            eps = jax.device_put(eps, data_sharding)
 
-        Xt = t_mult * X1 + (1 - t_mult) * X0
+            # t inherits the sharding from eps
+            t = jax.nn.sigmoid(eps)
+            t_mult = t[:, None, None, None]
 
-        state, loss = step_model(
-            state,
-            optimizer,
-            Xt,
-            X1 - X0,
-            t,
-            text_tokens,
-            masks,
-            model_sharding,
-            data_sharding,
-        )
-        model, _opt_state = state
+            Xt = t_mult * X1 + (1 - t_mult) * X0
+
+            state, loss, grads = step_model(
+                state,
+                optimizer,
+                Xt,
+                X1 - X0,
+                t,
+                text_tokens,
+                masks,
+                model_sharding,
+                data_sharding,
+                jnp.asarray(micro_step),
+                cfg.train.gradient_accum,
+                grads,
+            )
+            model, _opt_state = state
 
         if cfg.wandb.enabled and (step + 1) % cfg.train.every_n_steps == 0:
             wandb.log(
@@ -574,7 +631,7 @@ def main(cfg: DictConfig):
             model,
         )
 
-        # Ensure optimizer state matches the restored parameters.
+        # Ensures optimizer state matches the restored parameters.
         trainable_mask = get_trainable_mask(model)
         params, _ = eqx.partition(model, trainable_mask)
         opt_state = optimizer.init(params)

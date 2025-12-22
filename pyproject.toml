@@ -1,0 +1,2 @@
+[tool.pyrefly]
+check_all_files = true

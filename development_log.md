@@ -20,3 +20,5 @@ SD3 flow matching optimizations. `
 
 
 Note for the reparameterization trick, I will use the conditionless embedding as the base line
+
+I completed the reparam trick and made the text cond dit model with t5gemma as the text encoder, I will also already have the training pipeline done, I've sharded the new 15m dataset for the most part with new captions, just need to fill some holes. I'm going to try to use 16 gpus accross 2 nodes for more practice.
