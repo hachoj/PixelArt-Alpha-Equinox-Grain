@@ -292,20 +292,9 @@ def train(
         "A floating island made of melting clocks and marble staircases drifts through a sky of liquid clouds. The staircases lead nowhere, twisting into loops and spirals that defy gravity. A grand piano sits on the edge of a precipice, its keys pouring out water instead of sound, creating a waterfall that cascades into the abyss below. The lighting is surreal, with two light sources casting shadows in opposing directions—one warm and golden, the other cool and teal. Giant butterflies with wings made of stained glass flutter around the piano.",
     ]
 
-    validation_tokens, validation_masks = encode_with_t5gemma_encoder(
-        validation_captions,
-        model=t5gemma_model,
-        params=t5gemma_params,
-        tokenizer=preset.tokenizer,
-        max_input_length=cfg.train.max_input_length,
-        model_sharding=model_sharding,
-        data_sharding=data_sharding,
-        return_on_host=False,  # Keep them on device/sharded
-    )
-
-    validation_noise = jax.random.normal(key, shape=(1, 16, 32, 32), dtype=jnp.bfloat16)
-    validation_noise = jnp.repeat(validation_noise, repeats=8, axis=0)
-    validation_noise = eqx.filter_shard(validation_noise, data_sharding)
+    # Shard T5 params across devices (Data Parallel / FSDP-style) to save memory
+    t5_sharding = model_sharding
+    t5gemma_params = jax.device_put(t5gemma_params, t5_sharding)
 
     def _t5_forward(params, tokens, mask):
         encoder_acts = t5gemma_model.apply(
@@ -318,9 +307,25 @@ def train(
 
     t5_forward_jit = jax.jit(
         _t5_forward,
-        in_shardings=(model_sharding, data_sharding, data_sharding),
+        in_shardings=(t5_sharding, data_sharding, data_sharding),
         out_shardings=data_sharding,
     )
+
+    validation_tokens, validation_masks = encode_with_t5gemma_encoder(
+        validation_captions,
+        model=None,
+        params=t5gemma_params,
+        tokenizer=preset.tokenizer,
+        max_input_length=cfg.train.max_input_length,
+        model_sharding=t5_sharding,
+        data_sharding=data_sharding,
+        return_on_host=False,  # Keep them on device/sharded
+        forward_fn=t5_forward_jit,
+    )
+
+    validation_noise = jax.random.normal(key, shape=(1, 16, 32, 32), dtype=jnp.bfloat16)
+    validation_noise = jnp.repeat(validation_noise, repeats=8, axis=0)
+    validation_noise = eqx.filter_shard(validation_noise, data_sharding)
 
     start_time = time.time()
 
@@ -356,7 +361,7 @@ def train(
                 params=t5gemma_params,
                 tokenizer=preset.tokenizer,
                 max_input_length=cfg.train.max_input_length,
-                model_sharding=model_sharding,
+                model_sharding=t5_sharding,
                 data_sharding=data_sharding,
                 return_on_host=False,
                 forward_fn=t5_forward_jit,

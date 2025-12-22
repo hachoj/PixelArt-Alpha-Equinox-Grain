@@ -5,6 +5,6 @@ file_paths:
   - data/common_canvas_1.array_record
   - data/common_canvas_2.array_record
   - data/common_canvas_3.array_record
-num_workers: 0
+num_workers: 32
 batch_size: ${train.batch_size}
 seed: ${train.seed}

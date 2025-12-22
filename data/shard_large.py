@@ -182,7 +182,7 @@ for i, data in enumerate(dataloader):
             temperature=0.8,
             top_p=0.8,
             top_k=20,
-            max_new_tokens=300,
+            max_new_tokens=120,
         )
     print(f"Main process: Inference done for batch {i}")
 

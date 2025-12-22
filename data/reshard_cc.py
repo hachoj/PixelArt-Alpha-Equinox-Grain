@@ -33,6 +33,7 @@ for path in tqdm(os.listdir(base_dir)):
                 current_record_count = 0
                 write_path = f"data/common_canvas_{shard_number}.array_record"
                 writer = array_record_module.ArrayRecordWriter(write_path, "group_size:1")
+        break
     except:
         invalid_records[num] = True
 
