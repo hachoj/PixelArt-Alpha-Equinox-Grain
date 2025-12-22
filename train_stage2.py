@@ -574,6 +574,12 @@ def main(cfg: DictConfig):
     if "decoder" in t5gemma_params:
         del t5gemma_params["decoder"]  # pyrefly:ignore
 
+    # Cast T5 params to bfloat16 for faster inference
+    t5gemma_params = jax.tree_util.tree_map(
+        lambda x: x.astype(jnp.bfloat16) if eqx.is_inexact_array(x) else x,
+        t5gemma_params
+    )
+
     devices = jax.devices()
     mesh = jshard.Mesh(devices, axis_names=("data",))
 
