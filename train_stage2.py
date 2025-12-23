@@ -240,12 +240,7 @@ def step_model(
 
     condition: bool = micro_step >= grad_accum_steps - 1
     operands = (params_fp32, opt_state, gradients)
-    return jax.lax.cond(
-        condition,
-        update_step,
-        skip_step,
-        operands
-    )
+    return jax.lax.cond(condition, update_step, skip_step, operands)
 
 
 def train(
@@ -577,7 +572,7 @@ def main(cfg: DictConfig):
     # Cast T5 params to bfloat16 for faster inference
     t5gemma_params = jax.tree_util.tree_map(
         lambda x: x.astype(jnp.bfloat16) if eqx.is_inexact_array(x) else x,
-        t5gemma_params
+        t5gemma_params,
     )
 
     devices = jax.devices()
@@ -685,7 +680,6 @@ def main(cfg: DictConfig):
             f"Restoring previous trianing at step {checkpoint_manager.latest_step()}/{cfg.train.total_steps}"
         )
         restore_args = ocp.args.Composite(
-            state=ocp.args.StandardRestore(abstract_state),
             model_ema=ocp.args.StandardRestore(abstract_model),
             dataset=grain.PyGrainCheckpointRestore(data_iterator),
         )
