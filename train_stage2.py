@@ -17,7 +17,6 @@ import hydra
 from omegaconf import DictConfig
 import wandb
 import time
-import gc
 
 import diffrax
 from einops import rearrange
